@@ -77,6 +77,9 @@
 #define MBEDTLS_ECP_NO_INTERNAL_RNG
 #define MBEDTLS_ECP_C
 #define MBEDTLS_ECDSA_C
+#define MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED
+#define MBEDTLS_ECDH_C
+#define MBEDTLS_GCM_C
 
 #include "mbedtls/check_config.h"
 

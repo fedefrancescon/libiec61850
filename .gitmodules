@@ -1,0 +1,4 @@
+[submodule "third_party/mbedtls/mbedtls-2.28"]
+	path = third_party/mbedtls/mbedtls-2.28
+	url = https://github.com/Mbed-TLS/mbedtls
+	branch = mbedtls-2.28

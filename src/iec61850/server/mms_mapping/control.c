@@ -1872,7 +1872,7 @@ Control_readAccessControlObject(MmsMapping* self, MmsDomain* domain, char* varia
                     if (DEBUG_IED_SERVER)
                         printf("IED_SERVER: select not applicable for control model %u\n", controlObject->ctlModel);
 
-                    value = controlObject->sbo;
+                    value = &emptyString;
                 }
             }
 
@@ -2496,6 +2496,22 @@ ControlAction_getCtlNum(ControlAction self)
     }
 
     return -1;
+}
+
+bool
+ControlAction_getSynchroCheck(ControlAction self)
+{
+    ControlObject* controlObject = (ControlObject*) self;
+
+    return (bool)(controlObject->synchroCheck);
+}
+
+bool
+ControlAction_getInterlockCheck(ControlAction self)
+{
+    ControlObject* controlObject = (ControlObject*) self;
+
+    return (bool)(controlObject->interlockCheck);
 }
 
 bool

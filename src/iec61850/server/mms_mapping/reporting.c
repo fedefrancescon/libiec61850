@@ -1909,6 +1909,9 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
             if (updateReportDataset(self, rc, NULL, connection)) {
 
                 if (rc->reserved == false) {
+
+                    rc->resvTms = RESV_TMS_IMPLICIT_VALUE;
+
                     reserveRcb(rc, connection);
 
                     if (self->rcbEventHandler) {
@@ -2444,7 +2447,6 @@ exit_function:
                         self->rcbEventHandler(self->rcbEventHandlerParameter, rc->rcb, clientConnection, RCB_EVENT_RESERVED, NULL, DATA_ACCESS_ERROR_SUCCESS);
                     }
                 }
-
 
             }
             else if (rc->resvTms == -1) {
@@ -3877,7 +3879,9 @@ processEventsForReport(ReportControl* rc, uint64_t currentTimeInMs)
 void
 Reporting_processReportEvents(MmsMapping* self, uint64_t currentTimeInMs)
 {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->isModelLockedMutex);
+#endif
 
     if (self->isModelLocked == false) {
 
@@ -3894,7 +3898,9 @@ Reporting_processReportEvents(MmsMapping* self, uint64_t currentTimeInMs)
         }
     }
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->isModelLockedMutex);
+#endif
 }
 
 /*

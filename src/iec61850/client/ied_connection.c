@@ -652,6 +652,15 @@ IedConnection_tick(IedConnection self)
 }
 
 void
+IedConnection_setLocalAddress(IedConnection self, const char* localIpAddress, int localPort) 
+{
+    MmsConnection connection = self->connection;
+    IsoConnectionParameters isoP = MmsConnection_getIsoConnectionParameters(connection);
+      
+    IsoConnectionParameters_setLocalTcpParameters(isoP, localIpAddress, localPort);
+}
+
+void
 IedConnection_setConnectTimeout(IedConnection self, uint32_t timeoutInMs)
 {
     self->connectionTimeout = timeoutInMs;
@@ -1748,7 +1757,7 @@ IedConnection_getDeviceModelFromServer(IedConnection self, IedClientError* error
         LinkedList_destroy(logicalDeviceNames);
     }
     else
-        *error = iedConnection_mapMmsErrorToIedError(mmsError);
+        if (error) *error = iedConnection_mapMmsErrorToIedError(mmsError);
 }
 
 LinkedList /*<char*>*/

@@ -580,12 +580,19 @@ IedServer_createWithConfig(IedModel* dataModel, TLSConfiguration tlsConfiguratio
             self->enableBRCBResvTms = serverConfiguration->enableResvTmsForBRCB;
             self->enableOwnerForRCB = serverConfiguration->enableOwnerForRCB;
             self->syncIntegrityReportTimes = serverConfiguration->syncIntegrityReportTimes;
+            self->rcbSettingsWritable = serverConfiguration->reportSettingsWritable;
         }
         else {
             self->reportBufferSizeBRCBs = CONFIG_REPORTING_DEFAULT_REPORT_BUFFER_SIZE;
             self->reportBufferSizeURCBs = CONFIG_REPORTING_DEFAULT_REPORT_BUFFER_SIZE;
             self->enableOwnerForRCB = false;
             self->syncIntegrityReportTimes = false;
+            self->rcbSettingsWritable = IEC61850_REPORTSETTINGS_RPT_ID +
+                                        IEC61850_REPORTSETTINGS_BUF_TIME +
+                                        IEC61850_REPORTSETTINGS_DATSET +
+                                        IEC61850_REPORTSETTINGS_TRG_OPS +
+                                        IEC61850_REPORTSETTINGS_OPT_FIELDS +
+                                        IEC61850_REPORTSETTINGS_INTG_PD;
 #if (CONFIG_IEC61850_BRCB_WITH_RESVTMS == 1)
             self->enableBRCBResvTms = true;
 #else
@@ -687,27 +694,6 @@ IedServer_setRCBEventHandler(IedServer self, IedServer_RCBEventHandler handler, 
 {
     self->mmsMapping->rcbEventHandler = handler;
     self->mmsMapping->rcbEventHandlerParameter = parameter;
-}
-
-void
-IedServer_setRCBAccessHandler(IedServer self, IedServer_RCBAccessHandler handler, void* parameter)
-{
-    self->mmsMapping->rcbAccessHandler = handler;
-    self->mmsMapping->rcbAccessHandlerParameter = parameter;
-}
-
-void
-IedServer_setLCBAccessHandler(IedServer self, IedServer_LCBAccessHandler handler, void* parameter)
-{
-    self->mmsMapping->lcbAccessHandler = handler;
-    self->mmsMapping->lcbAccessHandlerParameter = parameter;
-}
-
-void
-IedServer_setLogAccessHandler(IedServer self, IedServer_LogAccessHandler handler, void* parameter)
-{
-    self->mmsMapping->logAccessHandler = handler;
-    self->mmsMapping->logAccessHandlerParameter = parameter;
 }
 
 void
@@ -1959,4 +1945,18 @@ IedServer_setDirectoryAccessHandler(IedServer self, IedServer_DirectoryAccessHan
 {
     self->mmsMapping->directoryAccessHandler = handler;
     self->mmsMapping->directoryAccessHandlerParameter = parameter;
+}
+
+void
+IedServer_setListObjectsAccessHandler(IedServer self, IedServer_ListObjectsAccessHandler handler, void* parameter)
+{
+    self->mmsMapping->listObjectsAccessHandler = handler;
+    self->mmsMapping->listObjectsAccessHandlerParameter = parameter;
+}
+
+void
+IedServer_setControlBlockAccessHandler(IedServer self, IedServer_ControlBlockAccessHandler handler, void* parameter)
+{
+    self->mmsMapping->controlBlockAccessHandler = handler;
+    self->mmsMapping->controlBlockAccessHandlerParameter = parameter;
 }

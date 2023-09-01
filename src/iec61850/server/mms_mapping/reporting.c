@@ -717,6 +717,8 @@ updateReportDataset(MmsMapping* mapping, ReportControl* rc, MmsValue* newDatSet,
 
     MmsValue* dataSetValue;
 
+    bool isUsedDataSetDynamic = rc->isDynamicDataSet;
+
     if (newDatSet != NULL) {
         if (strcmp(MmsValue_toString(newDatSet), "") == 0) {
             success = true;
@@ -785,15 +787,6 @@ updateReportDataset(MmsMapping* mapping, ReportControl* rc, MmsValue* newDatSet,
         if (rc->buffered) {
             if (dataSetChanged)
                 purgeBuf(rc);
-        }
-    }
-
-    if (rc->isDynamicDataSet) {
-        if (rc->dataSet && dataSetChanged) {
-            deleteDataSetValuesShadowBuffer(rc);
-            MmsMapping_freeDynamicallyCreatedDataSet(rc->dataSet);
-            rc->isDynamicDataSet = false;
-            rc->dataSet = NULL;
         }
     }
 
@@ -877,10 +870,19 @@ updateReportDataset(MmsMapping* mapping, ReportControl* rc, MmsValue* newDatSet,
 
 #endif /* (MMS_DYNAMIC_DATA_SETS == 1) */
 
+        if (rc->dataSet && rc->dataSet != dataSet)
+            dataSetChanged = true;
+
         if (dataSetChanged) {
 
             /* delete pending event and create buffer for new data set */
             deleteDataSetValuesShadowBuffer(rc);
+
+            if (isUsedDataSetDynamic) {
+                if (rc->dataSet) {
+                    MmsMapping_freeDynamicallyCreatedDataSet(rc->dataSet);
+                }
+            }
 
             rc->dataSet = dataSet;
 
@@ -1775,12 +1777,24 @@ ReportControl_readAccess(ReportControl* rc, MmsMapping* mmsMapping, MmsServerCon
 
     ClientConnection clientConnection = NULL;
 
-    if (mmsMapping->rcbAccessHandler || mmsMapping->rcbEventHandler) {
+    if (mmsMapping->controlBlockAccessHandler || mmsMapping->rcbEventHandler) {
         clientConnection = private_IedServer_getClientConnectionByHandle(mmsMapping->iedServer, connection);
     }
 
-    if (mmsMapping->rcbAccessHandler) {
-        if (mmsMapping->rcbAccessHandler(mmsMapping->rcbAccessHandlerParameter, rc->rcb, clientConnection, RCB_EVENT_GET_PARAMETER) == false) {
+    if (mmsMapping->controlBlockAccessHandler)
+    {
+        ACSIClass acsiClass;
+
+        if (rc->rcb->buffered)
+            acsiClass = ACSI_CLASS_BRCB;
+        else
+            acsiClass = ACSI_CLASS_URCB;
+
+        LogicalNode* ln = rc->rcb->parent;
+
+        LogicalDevice* ld = (LogicalDevice*)ln->parent;
+
+        if (mmsMapping->controlBlockAccessHandler(mmsMapping->controlBlockAccessHandlerParameter, clientConnection, acsiClass, ld, ln, rc->rcb->name, elementName, IEC61850_CB_ACCESS_TYPE_READ) == false) {
             accessError = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
             accessAllowed = false;
         }
@@ -1889,8 +1903,20 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
     ClientConnection clientConnection = private_IedServer_getClientConnectionByHandle(self->iedServer, connection);
 
     /* check if write access to RCB is allowed on this connection */
-    if (self->rcbAccessHandler) {
-        if (self->rcbAccessHandler(self->rcbAccessHandlerParameter, rc->rcb, clientConnection, RCB_EVENT_SET_PARAMETER) == false) {
+    if (self->controlBlockAccessHandler)
+    {
+        ACSIClass acsiClass;
+
+        if (rc->rcb->buffered)
+            acsiClass = ACSI_CLASS_BRCB;
+        else
+            acsiClass = ACSI_CLASS_URCB;
+
+        LogicalNode* ln = rc->rcb->parent;
+
+        LogicalDevice* ld = (LogicalDevice*)ln->parent;
+
+        if (self->controlBlockAccessHandler(self->controlBlockAccessHandlerParameter, clientConnection, acsiClass, ld, ln, rc->rcb->name, elementName, IEC61850_CB_ACCESS_TYPE_WRITE) == false) {
             retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
 
             goto exit_function_only_tracking;
@@ -2193,6 +2219,12 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
         }
         else if (strcmp(elementName, "DatSet") == 0) {
 
+            if (!(self->iedServer->rcbSettingsWritable & IEC61850_REPORTSETTINGS_DATSET))
+            {
+                retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
+                goto exit_function;
+            }
+
 #if (CONFIG_MMS_THREADLESS_STACK != 1)
             Semaphore_wait(rc->rcbValuesLock);
 #endif
@@ -2240,6 +2272,12 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
         }
         else if (strcmp(elementName, "IntgPd") == 0) {
 
+            if (!(self->iedServer->rcbSettingsWritable & IEC61850_REPORTSETTINGS_INTG_PD))
+            {
+                retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
+                goto exit_function;
+            }
+
 #if (CONFIG_MMS_THREADLESS_STACK != 1)
             Semaphore_wait(rc->rcbValuesLock);
 #endif
@@ -2286,6 +2324,12 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
             goto exit_function;
         }
         else if (strcmp(elementName, "TrgOps") == 0) {
+
+            if (!(self->iedServer->rcbSettingsWritable & IEC61850_REPORTSETTINGS_TRG_OPS))
+            {
+                retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
+                goto exit_function;
+            }
 
 #if (CONFIG_MMS_THREADLESS_STACK != 1)
             Semaphore_wait(rc->rcbValuesLock);
@@ -2360,6 +2404,12 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
 
         else if (strcmp(elementName, "BufTm") == 0) {
 
+            if (!(self->iedServer->rcbSettingsWritable & IEC61850_REPORTSETTINGS_BUF_TIME))
+            {
+                retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
+                goto exit_function;
+            }
+
 #if (CONFIG_MMS_THREADLESS_STACK != 1)
             Semaphore_wait(rc->rcbValuesLock);
 #endif
@@ -2392,6 +2442,12 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
             goto exit_function;
         }
         else if (strcmp(elementName, "RptID") == 0) {
+
+            if (!(self->iedServer->rcbSettingsWritable & IEC61850_REPORTSETTINGS_RPT_ID))
+            {
+                retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
+                goto exit_function;
+            }
 
 #if (CONFIG_MMS_THREADLESS_STACK != 1)
             Semaphore_wait(rc->rcbValuesLock);
@@ -2499,6 +2555,14 @@ Reporting_RCBWriteAccessHandler(MmsMapping* self, ReportControl* rc, char* eleme
             retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
 
             goto exit_function;
+        }
+        else if (strcmp(elementName, "OptFlds") == 0) {
+
+            if (!(self->iedServer->rcbSettingsWritable & IEC61850_REPORTSETTINGS_OPT_FIELDS))
+            {
+                retVal = DATA_ACCESS_ERROR_OBJECT_ACCESS_DENIED;
+                goto exit_function;
+            }
         }
 
 #if (CONFIG_MMS_THREADLESS_STACK != 1)

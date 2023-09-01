@@ -42,6 +42,13 @@ extern "C" {
 #include "iso_connection_parameters.h"
 #include "iec61850_config_file_parser.h"
 
+#define IEC61850_REPORTSETTINGS_RPT_ID 1
+#define IEC61850_REPORTSETTINGS_BUF_TIME 2
+#define IEC61850_REPORTSETTINGS_DATSET 4
+#define IEC61850_REPORTSETTINGS_TRG_OPS 8
+#define IEC61850_REPORTSETTINGS_OPT_FIELDS 16
+#define IEC61850_REPORTSETTINGS_INTG_PD 32
+
 /**
  * \brief Configuration object to configure IEC 61850 stack features
  */
@@ -99,6 +106,9 @@ struct sIedServerConfig
 
     /** integrity report start times will by synchronized with straight numbers (default: false) */
     bool syncIntegrityReportTimes;
+
+    /** for each configurable ReportSetting there is a separate flag (default: Dyn = enable write for all) */
+    uint8_t reportSettingsWritable;
 };
 
 /**
@@ -387,6 +397,27 @@ IedServerConfig_useIntegratedGoosePublisher(IedServerConfig self, bool enable);
  */
 LIB61850_API bool
 IedServerConfig_isLogServiceEnabled(IedServerConfig self);
+
+/**
+ * \brief Make a configurable report setting writeable or read-only
+ *
+ * \note Can be used to implement some of Services\ReportSettings options
+ *
+ * \param[in] setting one of IEC61850_REPORTSETTINGS_RPT_ID, _BUF_TIME, _DATSET, _TRG_OPS, _OPT_FIELDS, _INTG_PD
+ * \param[in] isDyn true, when setting is writable ("Dyn") or false, when read-only
+ */
+LIB61850_API void
+IedServerConfig_setReportSetting(IedServerConfig self, uint8_t setting, bool isDyn);
+
+/**
+ * \brief Check if a configurable report setting is writable or read-only
+ *
+ * \param[in] setting one of IEC61850_REPORTSETTINGS_RPT_ID, _BUF_TIME, _DATSET, _TRG_OPS, _OPT_FIELDS, _INTG_PD
+ *
+ * \return  isDyn true, when setting is writable ("Dyn") or false, when read-only
+ */
+LIB61850_API bool
+IedServerConfig_getReportSetting(IedServerConfig self, uint8_t setting);
 
 /**
  * An opaque handle for an IED server instance
@@ -1861,77 +1892,6 @@ typedef MmsDataAccessError
 LIB61850_API void
 IedServer_setReadAccessHandler(IedServer self, ReadAccessHandler handler, void* parameter);
 
-/**
- * \brief Callback that is called in case of RCB access to give the user the opportunity to block or allow the operation
- * 
- * \note This callback is called before the IedServer_RCBEventHandler and only in case of operations (RCB_EVENT_GET_PARAMETER, RCB_EVENT_SET_PARAMETER, RCB_EVENT_ENABLE
- * 
- * \param parameter user provided parameter
- * \param rcb affected report control block
- * \param connection client connection that is involved
- * \param operation one of the following operation event types: RCB_EVENT_GET_PARAMETER, RCB_EVENT_SET_PARAMETER
- */
-typedef bool
-(*IedServer_RCBAccessHandler) (void* parameter, ReportControlBlock* rcb, ClientConnection connection, IedServer_RCBEventType operation);
-
-/**
- * \brief Set a handler to control read and write access to report control blocks (RCBs)
- *
- * \param self the instance of IedServer to operate on.
- * \param handler the event handler to be used
- * \param parameter a user provided parameter that is passed to the handler.
- */
-LIB61850_API void
-IedServer_setRCBAccessHandler(IedServer self, IedServer_RCBAccessHandler handler, void* parameter);
-
-typedef enum {
-    LCB_EVENT_GET_PARAMETER,
-    LCB_EVENT_SET_PARAMETER
-} IedServer_LCBEventType;
-
-/**
- * \brief Callback that is called in case of LCB access to give the user the opportunity to block or allow the operation
- * 
- * 
- * \param parameter user provided parameter
- * \param lcb affected log control block
- * \param connection client connection that is involved
- * \param operation one of the following operation event types: LCB_EVENT_GET_PARAMETER, LCB_EVENT_SET_PARAMETER
- */
-typedef bool
-(*IedServer_LCBAccessHandler) (void* parameter, LogControlBlock* lcb, ClientConnection connection, IedServer_LCBEventType operation);
-
-/**
- * \brief Set a handler to control read and write access to log control blocks (LCBs)
- *
- * \param self the instance of IedServer to operate on.
- * \param handler the event handler to be used
- * \param parameter a user provided parameter that is passed to the handler.
- */
-LIB61850_API void
-IedServer_setLCBAccessHandler(IedServer self, IedServer_LCBAccessHandler handler, void* parameter);
-
-/**
- * \brief Callback that is called when the client is trying to read log data
- * 
- * \param parameter user provided parameter
- * \param logRef object reference of the log
- * \param connection client connection that is involved
- * 
- * \return true to allow read log data, false to deny
- */
-typedef bool
-(*IedServer_LogAccessHandler) (void* parameter, const char* logRef, ClientConnection connection);
-
-/**
- * \brief Set a handler control access to a log (read log data)
- * 
- * \param handler the callback handler to be used
- * \param parameter a user provided parameter that is passed to the handler.
- */
-LIB61850_API void
-IedServer_setLogAccessHandler(IedServer self, IedServer_LogAccessHandler handler, void* parameter);
-
 typedef enum {
     DATASET_CREATE,
     DATASET_DELETE,
@@ -1975,6 +1935,67 @@ typedef bool
 
 LIB61850_API void
 IedServer_setDirectoryAccessHandler(IedServer self, IedServer_DirectoryAccessHandler handler, void* parameter);
+
+/**
+ * \brief Callback that is called when a client is invoking a list objects service
+ *
+ * This callback can be used to control the list object access to specific objects and is called for each object that are subject to a client request.
+ *
+ * \param parameter user provided parameter
+ * \param connection client connection that is involved
+ * \param acsiClass the ACSI class of the object
+ * \param ld the logical device of the object
+ * \param ln the logical node of the object
+ * \param objectName the name of the object (e.g. data object name, data set name, log name, RCB name, ...)
+ * \param subObjectName the name of a sub element of an object or NULL
+ * \param fc the functional constraint of the object of IEC61850_FC_NONE when the object has no FC.
+ *
+ * \return true to include the object in the service response, otherwise false
+ */
+typedef bool
+(*IedServer_ListObjectsAccessHandler)(void* parameter, ClientConnection connection, ACSIClass acsiClass, LogicalDevice* ld, LogicalNode* ln, const char* objectName, const char* subObjectName, FunctionalConstraint fc);
+
+/**
+ * \brief Set a handler to control which objects are return by the list objects services
+ *
+ * \param handler the callback handler to be used
+ * \param parameter a user provided parameter that is passed to the handler.
+ */
+LIB61850_API void
+IedServer_setListObjectsAccessHandler(IedServer self, IedServer_ListObjectsAccessHandler handler, void* parameter);
+
+typedef enum {
+    IEC61850_CB_ACCESS_TYPE_READ,
+    IEC61850_CB_ACCESS_TYPE_WRITE
+} IedServer_ControlBlockAccessType;
+
+/**
+ * \brief Callback that is called when a client is invoking a read or write service to a control block or log
+ *
+ * This callback can be used to control the read and write access to control blocks and logs (SGCB, LCBs, URCBs, BRCBs, GoCBs, SVCBs, logs)
+ *
+ * \param parameter user provided parameter
+ * \param connection client connection that is involved
+ * \param acsiClass the ACSI class of the object
+ * \param ld the logical device of the object
+ * \param ln the logical node of the object
+ * \param objectName the name of the object (e.g. data object name, data set name, log name, RCB name, ...)
+ * \param subObjectName the name of a sub element of an object or NULL
+ * \param accessType access type (read=IEC61850_CB_ACCESS_TYPE_READ or write=IEC61850_CB_ACCESS_TYPE_WRITE)
+ *
+ * \return true to include the object in the service response, otherwise false
+ */
+typedef bool
+(*IedServer_ControlBlockAccessHandler)(void* parameter, ClientConnection connection, ACSIClass acsiClass, LogicalDevice* ld, LogicalNode* ln, const char* objectName, const char* subObjectName, IedServer_ControlBlockAccessType accessType);
+
+/**
+ * \brief Set a handler to control read and write access to control blocks and logs
+ *
+ * \param handler the callback handler to be used
+ * \param parameter a user provided parameter that is passed to the handler.
+ */
+LIB61850_API void
+IedServer_setControlBlockAccessHandler(IedServer self, IedServer_ControlBlockAccessHandler handler, void* parameter);
 
 /**@}*/
 

@@ -231,6 +231,17 @@ IedConnection_createWithTlsSupport(TLSConfiguration tlsConfig);
 LIB61850_API void
 IedConnection_destroy(IedConnection self);
 
+/**
+* \brief Set the local IP address and port to be used by the client
+*
+* NOTE: This function is optional. When not used the OS decides what IP address and TCP port to use.
+*
+* \param self IedConnection instance
+* \param localIpAddress the local IP address or hostname as C string
+* \param localPort the local TCP port to use. When < 1 the OS will chose the TCP port to use.
+*/
+LIB61850_API void
+IedConnection_setLocalAddress(IedConnection self, const char* localIpAddress, int localPort);
 
 /**
  * \brief set the connect timeout in ms
@@ -2455,20 +2466,6 @@ IedConnection_getServerDirectory(IedConnection self, IedClientError* error, bool
  */
 LIB61850_API LinkedList /*<char*>*/
 IedConnection_getLogicalDeviceDirectory(IedConnection self, IedClientError* error, const char* logicalDeviceName);
-
-typedef enum {
-    ACSI_CLASS_DATA_OBJECT,
-    ACSI_CLASS_DATA_SET,
-    ACSI_CLASS_BRCB,
-    ACSI_CLASS_URCB,
-    ACSI_CLASS_LCB,
-    ACSI_CLASS_LOG,
-    ACSI_CLASS_SGCB,
-    ACSI_CLASS_GoCB,
-    ACSI_CLASS_GsCB,
-    ACSI_CLASS_MSVCB,
-    ACSI_CLASS_USVCB
-} ACSIClass;
 
 /**
  * \brief returns a list of all MMS variables that are children of the given logical node

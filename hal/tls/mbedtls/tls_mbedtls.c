@@ -265,7 +265,7 @@ TLSConfiguration_create()
 
         mbedtls_ssl_conf_authmode(&(self->conf), MBEDTLS_SSL_VERIFY_REQUIRED);
 
-        mbedtls_ssl_conf_renegotiation(&(self->conf), MBEDTLS_SSL_LEGACY_NO_RENEGOTIATION);
+        mbedtls_ssl_conf_renegotiation(&(self->conf), MBEDTLS_SSL_RENEGOTIATION_ENABLED);
 
         /* static int hashes[] = {3,4,5,6,7,8,0}; */
         /* mbedtls_ssl_conf_sig_hashes(&(self->conf), hashes); */
@@ -852,7 +852,8 @@ TLSSocket_performHandshake(TLSSocket self)
 {
     int ret = mbedtls_ssl_renegotiate(&(self->ssl));
 
-    if (ret == 0) {
+    if (ret == 0 || ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+        ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS || ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS) {
         if (getTLSVersion(self->ssl.major_ver, self->ssl.minor_ver) < TLS_VERSION_TLS_1_2) {
             raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_WARNING, TLS_EVENT_CODE_WRN_INSECURE_TLS_VERSION, "Warning: Insecure TLS version", self);
         }
@@ -862,10 +863,12 @@ TLSSocket_performHandshake(TLSSocket self)
     else {
         DEBUG_PRINT("TLS", "TLSSocket_performHandshake failed -> ret=%i\n", ret);
 
-        if (self->tlsConfig->eventHandler) {
-            uint32_t flags = mbedtls_ssl_get_verify_result(&(self->ssl));
+        raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_INFO, TLS_EVENT_CODE_INF_SESSION_RENEGOTIATION, "Alarm: Renegotiation failed", self);
 
-            createSecurityEvents(self->tlsConfig, ret, flags, self);
+        /* mbedtls_ssl_renegotiate mandates to reset the ssl session in case of errors */
+        ret = mbedtls_ssl_session_reset(&(self->ssl));
+        if (ret != 0) {
+            DEBUG_PRINT("TLS", "mbedtls_ssl_session_reset failed -> ret: -0x%X\n", -ret);
         }
 
         return false;

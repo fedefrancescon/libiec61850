@@ -925,7 +925,7 @@ TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
 
     int ret = mbedtls_ssl_read(&(self->ssl), buf, size);
 
-    if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
+    if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE) || (ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS) || (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS))
         return 0;
 
     if (ret < 0) {
@@ -934,11 +934,11 @@ TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
         {
         case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
             DEBUG_PRINT("TLS", " connection was closed gracefully\n");
-            return -1;
+            break;
 
         case MBEDTLS_ERR_NET_CONN_RESET:
             DEBUG_PRINT("TLS", " connection was reset by peer\n");
-            return -1;
+            break;
 
         default:
             DEBUG_PRINT("TLS", " mbedtls_ssl_read returned -0x%x\n", -ret);
@@ -948,9 +948,9 @@ TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
 
                 createSecurityEvents(self->tlsConfig, ret, flags, self);
             }
-
-            return -1;
         }
+
+        mbedtls_ssl_session_reset(&(self->ssl));
     }
 
     return ret;
@@ -970,17 +970,13 @@ TLSSocket_write(TLSSocket self, uint8_t* buf, int size)
 
     while ((ret = mbedtls_ssl_write(&(self->ssl), buf, len)) <= 0)
     {
-        if (ret == MBEDTLS_ERR_NET_CONN_RESET)
-        {
-            DEBUG_PRINT("TLS", "peer closed the connection\n");
-            return -1;
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE) || (ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS) || (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS)) {
+            continue;
         }
 
-        if ((ret != MBEDTLS_ERR_SSL_WANT_READ) && (ret != MBEDTLS_ERR_SSL_WANT_WRITE))
-        {
-            DEBUG_PRINT("TLS", "mbedtls_ssl_write returned %d\n", ret);
-            return -1;
-        }
+        mbedtls_ssl_session_reset(&(self->ssl));
+        DEBUG_PRINT("TLS", "mbedtls_ssl_write returned -0x%X\n", -ret);
+        return -1;
     }
 
     len = ret;

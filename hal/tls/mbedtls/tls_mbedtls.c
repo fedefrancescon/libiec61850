@@ -930,15 +930,26 @@ TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
         return -1;
     }
 
-    int ret = mbedtls_ssl_read(&(self->ssl), buf, size);
+    int len = 0;
+    while (len < size) {
+        int ret = mbedtls_ssl_read(&(self->ssl), (buf + len), (size - len));
+        if (ret == 0) {
+            break;
+        } else if (ret > 0) {
+            len += ret;
+            continue;
+        }
 
-    if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE) || (ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS) || (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS))
-        return 0;
-
-    if (ret < 0) {
-
+        // Negative values means errors
         switch (ret)
         {
+        case MBEDTLS_ERR_SSL_WANT_READ: // Falling through
+        case MBEDTLS_ERR_SSL_WANT_WRITE:
+        case MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS:
+        case MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS:
+            continue;
+            break;
+
         case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
             DEBUG_PRINT("TLS", " connection was closed gracefully\n");
             break;
@@ -958,16 +969,15 @@ TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
         }
 
         mbedtls_ssl_session_reset(&(self->ssl));
+        return ret;
     }
-
-    return ret;
+    return len;
 }
 
 int
 TLSSocket_write(TLSSocket self, uint8_t* buf, int size)
 {
-    int ret;
-    int len = size;
+    int len = 0;
 
     checkForCRLUpdate(self);
 
@@ -975,18 +985,22 @@ TLSSocket_write(TLSSocket self, uint8_t* buf, int size)
         return -1;
     }
 
-    while ((ret = mbedtls_ssl_write(&(self->ssl), buf, len)) <= 0)
+    while (len < size)
     {
-        if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE) || (ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS) || (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS)) {
+        int ret = mbedtls_ssl_write(&(self->ssl), (buf + len), (size -len));
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE) ||
+            (ret == MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS) || (ret == MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS)) {
             continue;
         }
 
-        mbedtls_ssl_session_reset(&(self->ssl));
-        DEBUG_PRINT("TLS", "mbedtls_ssl_write returned -0x%X\n", -ret);
-        return -1;
-    }
+        if (ret < 0) {
+            mbedtls_ssl_session_reset(&(self->ssl));
+            DEBUG_PRINT("TLS", "mbedtls_ssl_write returned -0x%X\n", -ret);
+            return -1;
+        }
 
-    len = ret;
+        len += ret;
+    }
 
     return len;
 }

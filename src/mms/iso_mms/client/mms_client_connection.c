@@ -1,7 +1,7 @@
 /*
  *  mms_client_connection.c
  *
- *  Copyright 2013-2022 Michael Zillgith
+ *  Copyright 2013-2024 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -242,6 +242,10 @@ getNextInvokeId(MmsConnection self)
 
     Semaphore_wait(self->nextInvokeIdLock);
     self->nextInvokeId++;
+
+    if (self->nextInvokeId == 0)
+        self->nextInvokeId = 1;
+
     nextInvokeId = self->nextInvokeId;
     Semaphore_post(self->nextInvokeIdLock);
 
@@ -436,7 +440,17 @@ convertServiceErrorToMmsError(MmsServiceError serviceError)
         break;
 
     case 4: /* class: service */
-        mmsError = MMS_ERROR_SERVICE_OTHER;
+
+        switch (serviceError.errorCode)
+        {
+        case 5:
+            mmsError = MMS_ERROR_SERVICE_OBJECT_CONSTRAINT_CONFLICT;
+            break;
+
+        default:
+            mmsError = MMS_ERROR_SERVICE_OTHER;
+            break;
+        }
         break;
 
     case 5: /* class: service-preempt */

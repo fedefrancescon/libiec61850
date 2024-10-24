@@ -52,6 +52,12 @@ option(CONFIG_IEC61850_SERVICE_TRACKING "Build with support for IEC 61850 servic
 option(CONFIG_IEC61850_SETTING_GROUPS "Build with support for IEC 61850 setting group services" ON)
 option(CONFIG_IEC61850_SUPPORT_USER_READ_ACCESS_CONTROL "Allow user provided callback to control read access" ON)
 option(CONFIG_IEC61850_RCB_ALLOW_ONLY_PRECONFIGURED_CLIENT "allow only configured clients (when pre-configured by ClientLN)" OFF)
+option(CONFIG_IEC61850_L2_GOOSE "Build with support for L2 GOOSE (winpcap required on windows)" ON)
+option(CONFIG_IEC61850_L2_SMV "Build with support for L2 SMV (winpcap required on windows)" ON)
+option(CONFIG_IEC61850_R_GOOSE "Build with support for R-GOOSE (mbedtls required)" ON)
+option(CONFIG_IEC61850_R_SMV "Build with support for R-SMV (mbedtls required)" ON)
+option(CONFIG_IEC61850_SNTP_CLIENT "Build with SNTP client code" ON)
+
 set(CONFIG_IEC61850_SG_RESVTMS 300 CACHE STRING "Configure the maximum number of SG RESVTMS")
 
 set(CONFIG_REPORTING_DEFAULT_REPORT_BUFFER_SIZE "65536" CACHE STRING "Default buffer size for buffered reports in byte" )
@@ -77,6 +83,7 @@ include_directories(
     ${CMAKE_CURRENT_LIST_DIR}/src/common/inc
     ${CMAKE_CURRENT_LIST_DIR}/src/goose
     ${CMAKE_CURRENT_LIST_DIR}/src/sampled_values
+    ${CMAKE_CURRENT_LIST_DIR}/src/r_session
     ${CMAKE_CURRENT_LIST_DIR}/src/hal/inc
     ${CMAKE_CURRENT_LIST_DIR}/src/iec61850/inc
     ${CMAKE_CURRENT_LIST_DIR}/src/iec61850/inc_private
@@ -96,6 +103,7 @@ set(API_HEADERS
     hal/inc/tls_config.h
     src/common/inc/libiec61850_common_api.h
     src/common/inc/linked_list.h
+    src/common/inc/sntp_client.h
     src/iec61850/inc/iec61850_client.h
     src/iec61850/inc/iec61850_common.h
     src/iec61850/inc/iec61850_server.h
@@ -115,6 +123,7 @@ set(API_HEADERS
     src/goose/goose_publisher.h
     src/sampled_values/sv_subscriber.h
     src/sampled_values/sv_publisher.h
+    src/r_session/r_session.h
     src/logging/logging_api.h
 )
 
@@ -125,7 +134,24 @@ if(MSVC AND MSVC_VERSION LESS 1800)
 endif(MSVC AND MSVC_VERSION LESS 1800)
 
 if(CONFIG_USE_EXTERNAL_MBEDTLS_DYNLIB)
+
+if(EXISTS "${CONFIG_EXTERNAL_MBEDTLS_INCLUDE_PATH}/mbedtls/build_info.h")
+
+file (READ "${CONFIG_EXTERNAL_MBEDTLS_INCLUDE_PATH}/mbedtls/build_info.h" MBEDTLS_VERSION_FILE)
+
+string (FIND "${MBEDTLS_VERSION_FILE}" "Mbed TLS 3.6." matchresult)
+
+if(${matchresult} EQUAL -1)
+    set(WITH_MBEDTLS 1)
+else()
+    set(WITH_MBEDTLS3 1)
+    message("Using external mbedtls 3.6.x")
+endif ()
+
+else()
 set(WITH_MBEDTLS 1)
+endif(EXISTS "${CONFIG_EXTERNAL_MBEDTLS_INCLUDE_PATH}/mbedtls/build_info.h")
+
 set(USE_PREBUILD_MBEDTLS 1)
 set(MBEDTLS_INCLUDE_DIR ${CONFIG_EXTERNAL_MBEDTLS_INCLUDE_PATH})
 endif(CONFIG_USE_EXTERNAL_MBEDTLS_DYNLIB)
@@ -135,16 +161,38 @@ set(FOUND_SQLITE3_SOURCE 1)
 message("Found sqlite3 source in third_party folder -> can compile with log service support")
 endif(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/sqlite/sqlite3.h)
 
+if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/mbedtls/mbedtls-3.6.0)
+set(WITH_MBEDTLS3 1)
+set(MBEDTLS_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/mbedtls/mbedtls-3.6.0/include")
+else()
 if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/mbedtls/mbedtls-2.28)
 set(WITH_MBEDTLS 1)
 set(MBEDTLS_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}/third_party/mbedtls/mbedtls-2.28/include")
 endif(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/mbedtls/mbedtls-2.28)
+endif(EXISTS ${CMAKE_CURRENT_LIST_DIR}/third_party/mbedtls/mbedtls-3.6.0)
 
-if(WITH_MBEDTLS)
+if(WITH_MBEDTLS OR WITH_MBEDTLS3)
 
 add_definitions(-DCONFIG_MMS_SUPPORT_TLS=1)
 
-endif(WITH_MBEDTLS)
+if (CONFIG_IEC61850_R_GOOSE)
+set(BUILD_R_GOOSE_EXAMPLES 1)
+endif (CONFIG_IEC61850_R_GOOSE)
+
+if (CONFIG_IEC61850_R_SMV)
+set(BUILD_R_SMV_EXAMPLES 1)
+endif (CONFIG_IEC61850_R_SMV)
+
+if (CONFIG_IEC61850_SNTP_CLIENT)
+set(BUILD_SNTP_CLIENT_EXAMPLES 1)
+endif (CONFIG_IEC61850_SNTP_CLIENT)
+
+else(WITH_MBEDTLS OR WITH_MBEDTLS3)
+
+set(CONFIG_IEC61850_R_GOOSE 0)
+set(CONFIG_IEC61850_R_SMV 0)
+
+endif(WITH_MBEDTLS OR WITH_MBEDTLS3)
 
 include(CheckCCompilerFlag)
 

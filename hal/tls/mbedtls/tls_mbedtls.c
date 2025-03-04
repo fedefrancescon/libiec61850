@@ -37,6 +37,22 @@
 
 #if (CONFIG_DEBUG_TLS == 1)
 #define DEBUG_PRINT(appId, fmt, ...) fprintf(stderr, "%s: " fmt, appId, ## __VA_ARGS__)
+
+static void debug_print_mbedtls(void *ctx, int level, const char *file, int line, const char *str)
+{
+    const char *p, *basename;
+    (void) ctx;
+
+    /* Extract basename from file */
+    for(p = basename = file; *p != '\0'; p++) {
+        if(*p == '/' || *p == '\\') {
+            basename = p + 1;
+        }
+    }
+
+    mbedtls_printf("%s:%04d: |%d| %s", basename, line, level, str);
+}
+
 #else
 #define DEBUG_PRINT(fmt, ...) do {} while(0)
 #endif
@@ -71,7 +87,7 @@ struct sTLSConfiguration {
 
     /* TLS minimum version allowed (default: TLS_VERSION_TLS_1_0) */
     TLSConfigVersion minVersion;
-    
+
     /* TLS maximum version allowed (default: TLS_VERSION_TLS_1_2) */
     TLSConfigVersion maxVersion;
 
@@ -307,7 +323,6 @@ TLSConfiguration
 TLSConfiguration_create()
 {
     TLSConfiguration self = (TLSConfiguration) GLOBAL_CALLOC(1, sizeof(struct sTLSConfiguration));
-
     if (self)
     {
         mbedtls_ssl_config_init( &(self->conf) );
@@ -330,6 +345,10 @@ TLSConfiguration_create()
         mbedtls_ssl_conf_authmode(&(self->conf), MBEDTLS_SSL_VERIFY_REQUIRED);
 
         mbedtls_ssl_conf_renegotiation(&(self->conf), MBEDTLS_SSL_RENEGOTIATION_ENABLED);
+        #if CONFIG_DEBUG_TLS == 1
+            mbedtls_debug_set_threshold(5);
+            mbedtls_ssl_conf_dbg(&(self->conf), debug_print_mbedtls, NULL);
+        #endif
 
         self->minVersion = TLS_VERSION_TLS_1_2;
         self->maxVersion = TLS_VERSION_NOT_SELECTED;
@@ -338,7 +357,7 @@ TLSConfiguration_create()
 
         self->allowedCertificates = LinkedList_create();
 
-        /* default behavior is to allow all certificates that are signed by the CA */
+        /* default behavior is to allow all certificates that are signed by the CA*/
         self->chainValidation = true;
         self->allowOnlyKnownCertificates = false;
         self->setupComplete = false;

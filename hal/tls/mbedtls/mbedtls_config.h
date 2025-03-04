@@ -85,7 +85,20 @@
 #define MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA_ENABLED
 #define MBEDTLS_KEY_EXCHANGE_ECDH_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_PSK_ENABLED
 #define MBEDTLS_ECDH_C
+
+#define MBEDTLS_DHM_C
+#define MBEDTLS_KEY_EXCHANGE_DHE_RSA_ENABLED
+#define MBEDTLS_KEY_EXCHANGE_RSA_ENABLED
+
+#define MBEDTLS_CCM_C
+
+/* Save RAM at the expense of ROM */
+#define MBEDTLS_AES_ROM_TABLES
+
+/* Significant speed benefit at the expense of some ROM */
+#define MBEDTLS_ECP_NIST_OPTIM
 
 #include "mbedtls/check_config.h"
 

@@ -100,6 +100,13 @@
 /* Significant speed benefit at the expense of some ROM */
 #define MBEDTLS_ECP_NIST_OPTIM
 
+/**
+ * Since mbedtls 2.28.10 Host checks is enforced, we can't rely on the CN to verify the cert
+ * so we keep the old behaviour to allow proper testing, since we're already verifying the certificate chain
+ * See: https://github.com/Mbed-TLS/mbedtls/commit/63f958df772f763dfd5b6d0506f9cac9ed34c34e
+ */
+#define MBEDTLS_SSL_CLI_ALLOW_WEAK_CERTIFICATE_VERIFICATION_WITHOUT_HOSTNAME
+
 #include "mbedtls/check_config.h"
 
 #endif /* MBEDTLS_CONFIG_H */

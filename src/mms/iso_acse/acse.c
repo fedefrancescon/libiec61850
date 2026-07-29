@@ -130,14 +130,14 @@ parseUserInformation(AcseConnection* self, uint8_t* buffer, int bufPos, int maxB
 
         bufPos = BerDecoder_decodeLength(buffer, &len, bufPos, maxBufPos);
 
-        if (len == 0)
-            continue;
-
         if ((bufPos < 0) || (bufPos + len > maxBufPos))
         {
             *userInfoValid = false;
             return -1;
         }
+
+        if (len == 0)
+            continue;
 
         switch (tag)
         {
@@ -329,13 +329,13 @@ parseAarqPdu(AcseConnection* self, uint8_t* buffer, int bufPos, int maxBufPos)
 
         case 0xa6: /* calling AP title */
             {
-                if (buffer[bufPos] == 0x06)
+                if (len >= 2 && buffer[bufPos] == 0x06)
                 {
                     /* ap-title-form2 */
 
                     int innerLength = buffer[bufPos + 1];
 
-                    if (innerLength == len - 2)
+                    if ((innerLength >= 0) && (innerLength == len - 2))
                         BerDecoder_decodeOID(buffer, bufPos + 2, innerLength, &(self->applicationReference.apTitle));
                 }
             }
@@ -344,14 +344,14 @@ parseAarqPdu(AcseConnection* self, uint8_t* buffer, int bufPos, int maxBufPos)
 
         case 0xa7: /* calling AE qualifier */
             {
-                if (buffer[bufPos] == 0x02)
+                if (len >= 2 && buffer[bufPos] == 0x02)
                 {
                     /* ae-qualifier-form2 */
 
                     int innerLength = buffer[bufPos + 1];
 
-                    if (innerLength == len - 2)
-                        self->applicationReference.aeQualifier = BerDecoder_decodeInt32(buffer + 2, buffer[bufPos + 1], bufPos);
+                    if ((innerLength >= 0) && (innerLength == len - 2))
+                        self->applicationReference.aeQualifier = BerDecoder_decodeInt32(buffer, innerLength, bufPos + 2);
                 }
             }
             bufPos += len;
@@ -501,10 +501,10 @@ AcseConnection_parseMessage(AcseConnection* self, ByteBuffer* message)
     switch (messageType)
     {
     case 0x60:
-        indication = parseAarqPdu(self, buffer, bufPos, messageSize);
+        indication = parseAarqPdu(self, buffer, bufPos, bufPos + len);
         break;
     case 0x61:
-        indication = parseAarePdu(self, buffer, bufPos, messageSize);
+        indication = parseAarePdu(self, buffer, bufPos, bufPos + len);
         break;
     case 0x62: /* A_RELEASE.request RLRQ-apdu */
         indication = ACSE_RELEASE_REQUEST;

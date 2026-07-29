@@ -1,7 +1,7 @@
 /*
  *  map.c
  *
- *  Copyright 2013 Michael Zillgith
+ *  Copyright 2013-2025 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -43,8 +43,13 @@ Map
 Map_create()
 {
     Map map = (Map) GLOBAL_CALLOC(1, sizeof(struct sMap));
-    map->entries = LinkedList_create();
-    map->compareKeys = comparePointerKeys;
+
+    if (map)
+    {
+        map->entries = LinkedList_create();
+        map->compareKeys = comparePointerKeys;
+    }
+
     return map;
 }
 
@@ -57,17 +62,31 @@ Map_size(Map map)
 void*
 Map_addEntry(Map map, void* key, void* value)
 {
-    MapEntry* entry = (MapEntry*) GLOBAL_MALLOC(sizeof(MapEntry));
-    entry->key = key;
-    entry->value = value;
-    LinkedList_add(map->entries, entry);
+    if (map == NULL || key == NULL || value == NULL)
+        return NULL;
 
-    return entry->key;
+    MapEntry* entry = (MapEntry*) GLOBAL_MALLOC(sizeof(MapEntry));
+
+    if (entry)
+    {
+        entry->key = key;
+        entry->value = value;
+        LinkedList_add(map->entries, entry);
+
+        return entry->key;
+    }
+    else
+    {
+        return NULL;
+    }
 }
 
 void*
 Map_removeEntry(Map map, void* key, bool deleteKey)
 {
+    if (map == NULL || key == NULL)
+        return NULL;
+
     LinkedList element = map->entries;
     LinkedList lastElement = element;
     MapEntry* entry;

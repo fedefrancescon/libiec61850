@@ -1,7 +1,7 @@
 /*
  *  r_session.c
  *
- *  Copyright 2013-2022 Michael Zillgith
+ *  Copyright 2013-2026 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -89,7 +89,7 @@ struct sRSession
     int timeToNextKey;
 };
 
-#ifdef DEBUG_RSESSION
+#if (DEBUG_RSESSION == 1)
 static void
 printBuffer(uint8_t* buffer, int bufSize)
 {
@@ -102,7 +102,7 @@ printBuffer(uint8_t* buffer, int bufSize)
             printf(" (%i)\n", i + 1);
     }
 }
-#endif /* DEBUG_RSESSION */
+#endif /* (DEBUG_RSESSION == 1) */
 
 RSessionKeyMaterial
 RSessionKeyMaterial_create(uint32_t keyId, uint8_t* key, int keyLength, RSecurityAlgorithm secAlgo, RSignatureAlgorithm sigAlgo)
@@ -461,6 +461,12 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
         goto exit_error;
     }
 
+    if (msgSize < (commonSessionHeaderLength + bufPos))
+    {
+        DEBUG_PRINTF("message too small for common session header");
+        goto exit_error;
+    }
+
     /* SPDU length */
     uint32_t spduLength = 0;
     bufPos = decodeUInt32FixedSize(&spduLength, buffer, bufPos);
@@ -477,6 +483,15 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
     {
         /* parse version 1 common header parts */
 
+        /* Protocol v1 requires 16 bytes of protocol specific header minimum
+           (4 for timeOfCurrentKey + 2 for timeToNextKey + 2 for algos)
+           + 4 for keyId + 4 for payloadLength */
+        if (msgSize < bufPos + 16)
+        {
+            DEBUG_PRINTF("ERROR - insufficient header length for protocol v1");
+            goto exit_error;
+        }
+
         /* TimeOfCurrentKey */
         uint32_t timeOfCurrentKey;
         bufPos = decodeUInt32FixedSize(&timeOfCurrentKey, buffer, bufPos);
@@ -488,6 +503,13 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
         RSecurityAlgorithm secAlgo = (RSecurityAlgorithm) buffer[bufPos++];
 
         RSignatureAlgorithm sigAlgo = (RSignatureAlgorithm) buffer[bufPos++];
+
+        /* Protocol v1 does not support encryption - reject any non-NONE secAlgo */
+        if (secAlgo != R_SESSION_SEC_ALGO_NONE)
+        {
+            DEBUG_PRINTF("ERROR - protocol version 1 does not support encryption");
+            goto exit_error;
+        }
 
         /* Check if algorithms match the configured algorithms */
         if (secAlgo != self->secAlgo)
@@ -535,7 +557,7 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
         /* parse payload elements */
         uint32_t payloadEnd = bufPos + payloadLength;
 
-        if (payloadEnd > (uint32_t)msgSize)
+        if (payloadEnd < (uint32_t)bufPos || payloadEnd > (uint32_t)msgSize)
         {
             DEBUG_PRINTF("ERROR - payload size field invalid");
             goto exit_error;
@@ -550,6 +572,13 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
             {
                 if (RSessionCrypto_createHMAC(buffer, payloadEnd, key, keySize, signatureBuffer, 32))
                 {
+                    /* Check bounds for signature tag and length byte */
+                    if (payloadEnd + 2 > (uint32_t)msgSize)
+                    {
+                        DEBUG_PRINTF("ERROR - truncated signature header");
+                        goto exit_error;
+                    }
+
                     if (buffer[payloadEnd] != 0x85)
                     {
                         DEBUG_PRINTF("ERROR - no signature found");
@@ -557,10 +586,35 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
                     }
                     else
                     {
+                        /* Validate signature length byte */
+                        uint8_t sigLength = buffer[payloadEnd + 1];
+                        uint8_t expectedLength = 0;
+
+                        if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_128)
+                            expectedLength = 16;
+                        else if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_256)
+                            expectedLength = 32;
+                        else {
+                            DEBUG_PRINTF("ERROR - unsupported signature algorithm");
+                            goto exit_error;
+                        }
+
+                        if (sigLength != expectedLength)
+                        {
+                            DEBUG_PRINTF("ERROR - signature length mismatch");
+                            goto exit_error;
+                        }
+
+                        /* Check bounds for signature data */
+                        if (payloadEnd + 2 + sigLength > (uint32_t)msgSize)
+                        {
+                            DEBUG_PRINTF("ERROR - truncated signature data");
+                            goto exit_error;
+                        }
+
                         if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_128)
                         {
-                            /* TODO is payloadEnd +2 correct? */
-                            if (memcmp(signatureBuffer, buffer + payloadEnd + 1, 16))
+                            if (memcmp(signatureBuffer, buffer + payloadEnd + 2, 16))
                             {
                                 DEBUG_PRINTF("ERROR - signature not matching!");
                                 goto exit_error;
@@ -568,8 +622,7 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
                         }
                         else if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_256)
                         {
-                            /* TODO is payloadEnd +2 correct? */
-                            if (memcmp(signatureBuffer, buffer + payloadEnd + 1, 32))
+                            if (memcmp(signatureBuffer, buffer + payloadEnd + 2, 32))
                             {
                                 DEBUG_PRINTF("ERROR - signature not matching!");
                                 goto exit_error;
@@ -592,6 +645,13 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
 
         while ((uint32_t)bufPos < payloadEnd)
         {
+            /* Check we have enough bytes for ASDU header (1+1+2+2 = 6 bytes) */
+            if (bufPos + 6 > payloadEnd)
+            {
+                DEBUG_PRINTF("ERROR - truncated ASDU header");
+                goto exit_error;
+            }
+
             int payloadElementType = buffer[bufPos++];
 
             bool simulation;
@@ -608,6 +668,20 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
             bufPos = decodeUInt16FixedSize(&asduLength, buffer, bufPos);
 
             DEBUG_PRINTF("ASDU %02x sim: %i APPID: %04x length: %i", payloadElementType, simulation, appId, asduLength);
+
+            /* verify ASDU length field - check for overflow and bounds */
+            if (bufPos > payloadEnd || asduLength > payloadEnd - bufPos)
+            {
+                DEBUG_PRINTF("ERROR - ASDU length too large: %i", asduLength);
+                goto exit_error;
+            }
+
+            /* Final bounds check before handler */
+            if (bufPos + asduLength > (uint32_t)msgSize)
+            {
+                DEBUG_PRINTF("ERROR - ASDU extends beyond message buffer");
+                goto exit_error;
+            }
 
             if (payloadElementType == 0x81 ||
                 payloadElementType == 0x82)
@@ -627,6 +701,18 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
     else if (protocolVersion == 2)
     {
         /* parse version 2 common header parts */
+
+        /* Protocol v2 requires minimum bytes to read up to ivLen field:
+            - timeOfCurrentKey (4 bytes)
+            - timeToNextKey (2 bytes)
+            - keyId (4 bytes)
+            - ivLen (1 byte)
+            Total: 11 bytes */
+        if (msgSize < bufPos + 11)
+        {
+            DEBUG_PRINTF("ERROR - insufficient header length for protocol v2 (%i)", commonSessionHeaderLength);
+            goto exit_error;
+        }
 
         /* TimeOfCurrentKey */
         uint32_t timeOfCurrentKey;
@@ -673,8 +759,22 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
 
         if (ivLen > 0)
         {
+            /* Check that IV data fits within msgSize */
+            if (bufPos + ivLen > (uint32_t)msgSize)
+            {
+                DEBUG_PRINTF("ERROR - IV length field invalid");
+                goto exit_error;
+            }
+
             iv = buffer + bufPos;
             bufPos += ivLen;
+        }
+
+        /* Check we have space for payload length field */
+        if (bufPos + 4 > (uint32_t)msgSize)
+        {
+            DEBUG_PRINTF("ERROR - insufficient space for payload length field");
+            goto exit_error;
         }
 
         uint32_t payloadLength;
@@ -687,7 +787,7 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
         /* parse payload elements */
         uint32_t payloadEnd = bufPos + payloadLength;
 
-        if (payloadEnd > (uint32_t)msgSize)
+        if (payloadEnd < (uint32_t)bufPos || payloadEnd > (uint32_t)msgSize)
         {
             DEBUG_PRINTF("ERROR - payload size field invalid");
             goto exit_error;
@@ -702,6 +802,13 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
             {
                 if (RSessionCrypto_createHMAC(buffer, payloadEnd, key, keySize, signatureBuffer, 32))
                 {
+                    /* Check bounds for signature tag and length byte */
+                    if (payloadEnd + 2 > (uint32_t)msgSize)
+                    {
+                        DEBUG_PRINTF("ERROR - truncated signature header");
+                        goto exit_error;
+                    }
+
                     if (buffer[payloadEnd] != 0x85)
                     {
                         DEBUG_PRINTF("ERROR - no signature found");
@@ -709,10 +816,35 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
                     }
                     else
                     {
+                        /* Validate signature length byte */
+                        uint8_t sigLength = buffer[payloadEnd + 1];
+                        uint8_t expectedLength = 0;
+
+                        if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_128)
+                            expectedLength = 16;
+                        else if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_256)
+                            expectedLength = 32;
+                        else {
+                            DEBUG_PRINTF("ERROR - unsupported signature algorithm");
+                            goto exit_error;
+                        }
+
+                        if (sigLength != expectedLength)
+                        {
+                            DEBUG_PRINTF("ERROR - signature length mismatch");
+                            goto exit_error;
+                        }
+
+                        /* Check bounds for signature data */
+                        if (payloadEnd + 2 + sigLength > (uint32_t)msgSize)
+                        {
+                            DEBUG_PRINTF("ERROR - truncated signature data");
+                            goto exit_error;
+                        }
+
                         if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_128)
                         {
-                            /* TODO is payloadEnd +2 correct? */
-                            if (memcmp(signatureBuffer, buffer + payloadEnd + 1, 16))
+                            if (memcmp(signatureBuffer, buffer + payloadEnd + 2, 16))
                             {
                                 DEBUG_PRINTF("ERROR - signature not matching!");
                                 goto exit_error;
@@ -720,8 +852,7 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
                         }
                         else if (sigAlgo == R_SESSION_SIG_ALGO_HMAC_SHA256_256)
                         {
-                            /* TODO is payloadEnd +2 correct? */
-                            if (memcmp(signatureBuffer, buffer + payloadEnd + 1, 32))
+                            if (memcmp(signatureBuffer, buffer + payloadEnd + 2, 32))
                             {
                                 DEBUG_PRINTF("ERROR - signature not matching!");
                                 goto exit_error;
@@ -745,39 +876,75 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
         /* Check signature and decrypt application layer */
         if (secAlgo != R_SESSION_SEC_ALGO_NONE)
         {
-            /* Check for HMAC */
-            if (payloadEnd + 18 <= (uint32_t)msgSize)
+            /* Check for HMAC tag and length byte */
+            if (payloadEnd + 2 > (uint32_t)msgSize)
             {
-                if (self->payloadBuffer == NULL)
-                    self->payloadBuffer = (uint8_t*)GLOBAL_MALLOC(65000);
+                DEBUG_PRINTF("ERROR - truncated GCM trailer");
+                goto exit_error;
+            }
 
-                if (self->payloadBuffer)
+            if (buffer[payloadEnd] != 0x85)
+            {
+                DEBUG_PRINTF("ERROR - invalid GCM tag");
+                goto exit_error;
+            }
+
+            uint8_t* mac = buffer + payloadEnd + 2;
+            int macSize = buffer[payloadEnd + 1];
+
+            /* Validate MAC size (should be 16 for GCM) */
+            if (macSize != 16)
+            {
+                DEBUG_PRINTF("ERROR - invalid GCM MAC size: %d", macSize);
+                goto exit_error;
+            }
+
+            /* Check bounds for MAC data */
+            if (payloadEnd + 2 + macSize > (uint32_t)msgSize)
+            {
+                DEBUG_PRINTF("ERROR - truncated GCM MAC");
+                goto exit_error;
+            }
+
+            uint32_t payloadSize = payloadEnd - payloadStartPos;
+
+            if (payloadSize > self->bufferSize)
+            {
+                DEBUG_PRINTF("ERROR - payload size exceeds buffer size");
+                goto exit_error;
+            }
+
+            if (self->payloadBuffer == NULL)
+                self->payloadBuffer = (uint8_t*)GLOBAL_MALLOC(self->bufferSize);
+
+            if (self->payloadBuffer)
+            {
+                if (RSessionCrypto_gcmAuthAndDecrypt(key, keySize, iv, ivLen, buffer, payloadStartPos, payloadStart, payloadSize, self->payloadBuffer, mac, macSize))
                 {
-                    uint8_t* mac = buffer + payloadEnd + 2;
-                    int macSize = buffer[payloadEnd + 1];
-
-                    int payloadSize = payloadEnd - payloadStartPos;
-
-                    if (RSessionCrypto_gcmAuthAndDecrypt(key, keySize, iv, ivLen, buffer, payloadStartPos, payloadStart, payloadSize, self->payloadBuffer, mac, macSize))
-                    {
-                        memcpy(buffer + bufPos, self->payloadBuffer, payloadSize);
-                    }
-                    else
-                    {
-                        DEBUG_PRINTF("ERROR - auth and decrypt failed!");
-                        goto exit_error;
-                    }
+                    memcpy(buffer + bufPos, self->payloadBuffer, payloadSize);
+                }
+                else
+                {
+                    DEBUG_PRINTF("ERROR - auth and decrypt failed!");
+                    goto exit_error;
                 }
             }
             else
             {
-                DEBUG_PRINTF("ERROR - sec algo - message too small!");
+                DEBUG_PRINTF("ERROR - failed to allocate payload buffer!");
                 goto exit_error;
             }
         }
 
         while ((uint32_t)bufPos < payloadEnd)
         {
+            /* Check we have enough bytes for ASDU header (1+1+2+2 = 6 bytes) */
+            if (bufPos + 6 > payloadEnd)
+            {
+                DEBUG_PRINTF("ERROR - truncated ASDU header");
+                goto exit_error;
+            }
+
             int payloadElementType = buffer[bufPos++];
 
             bool simulation;
@@ -794,6 +961,20 @@ parseSessionMessage(RSession self, uint8_t* buffer, int msgSize, RSessionPayload
             bufPos = decodeUInt16FixedSize(&asduLength, buffer, bufPos);
 
             DEBUG_PRINTF("ASDU %02x sim: %i APPID: %04x length: %i", payloadElementType, simulation, appId, asduLength);
+
+            /* verify ASDU length field - check for overflow and bounds */
+            if (bufPos > payloadEnd || asduLength > payloadEnd - bufPos)
+            {
+                DEBUG_PRINTF("ERROR - ASDU length too large: %i", asduLength);
+                goto exit_error;
+            }
+
+            /* Final bounds check before handler */
+            if (bufPos + asduLength > (uint32_t)msgSize)
+            {
+                DEBUG_PRINTF("ERROR - ASDU extends beyond message buffer");
+                goto exit_error;
+            }
 
             if (payloadElementType == 0x81 ||
                 payloadElementType == 0x82)
@@ -1000,7 +1181,7 @@ encodePacket(RSession self, uint8_t payloadType, uint8_t* buffer, int bufPos, RS
         int addPartSize = encryptedPartStartPos - startPos;
         int encryptedPartSize = payloadEndPos - encryptedPartStartPos;
 
-#ifdef DEBUG_RSESSION
+#if (DEBUG_RSESSION == 1)
         printBuffer(buffer + startPos, bufPos - startPos);
 #endif
 
@@ -1040,6 +1221,12 @@ RSession_sendMessage(RSession self, RSessionProtocol_SPDU_ID spduId, bool simula
             return R_SESSION_ERROR_OUT_OF_MEMORY;
     }
 
+    /* Reject payloads that cannot fit within the send buffer (header overhead is ~128 bytes) */
+    if (payloadSize < 0 || payloadSize > (int)(self->bufferSize) - 128)
+    {
+        return R_SESSION_ERROR_INVALID_MESSAGE;
+    }
+
     if (self->socket)
     {
         struct sRSessionPayloadElement element;
@@ -1053,7 +1240,7 @@ RSession_sendMessage(RSession self, RSessionProtocol_SPDU_ID spduId, bool simula
 
         int msgSize = encodePacket(self, (uint8_t) spduId, self->sendBuffer, 0, &element);
 
-#ifdef DEBUG_RSESSION
+#if (DEBUG_RSESSION == 1)
         printBuffer(self->sendBuffer, msgSize);
 #endif
 
@@ -1075,6 +1262,12 @@ RSession_sendMessage(RSession self, RSessionProtocol_SPDU_ID spduId, bool simula
 void
 RSession_setBufferSize(RSession self, uint16_t bufferSize)
 {
+    if (self->payloadBuffer)
+    {
+        /* size cannot be changed while a payload buffer is allocated */
+        return;
+    }
+
     if (bufferSize > 127)
     {
         self->bufferSize = bufferSize;
@@ -1114,8 +1307,6 @@ RSession_receiveMessage(RSession self, RSessionPayloadElementHandler handler, vo
 
         if (msgSize < 1)
         {
-            DEBUG_PRINTF("RESSSION: Failed to receive message");
-
             return R_SESSION_ERROR_FAILED_TO_RECEIVE;
         }
         else

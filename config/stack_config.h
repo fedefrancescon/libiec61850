@@ -27,6 +27,9 @@
 #define DEBUG_SV_PUBLISHER 0
 #define DEBUG_HAL_ETHERNET 0
 
+/* Minimum MMS PDU SIZE - default is 128 - when value is smaller than this, the connection is rejected */
+#define CONFIG_MMS_MINIMUM_PDU_SIZE 128
+
 /* Maximum MMS PDU SIZE - default is 65000 */
 #define CONFIG_MMS_MAXIMUM_PDU_SIZE 65000
 
@@ -158,10 +161,14 @@
 #define CONFIG_IEC61850_FORCE_MEMORY_ALIGNMENT 1
 
 /* compile with support for R-GOOSE (mbedtls requried) */
+#ifndef CONFIG_IEC61850_R_GOOSE
 #define CONFIG_IEC61850_R_GOOSE 0
+#endif
 
 /* compile with support for R-SMV (mbedtls required) */
+#ifndef CONFIG_IEC61850_R_SMV
 #define CONFIG_IEC61850_R_SMV 0
+#endif
 
 /* compile with support for L2 GOOSE */
 #define CONFIG_IEC61850_L2_GOOSE 1
@@ -218,6 +225,9 @@
 
 /* maximum number of contemporary file upload tasks (obtainFile) per server instance */
 #define CONFIG_MMS_SERVER_MAX_GET_FILE_TASKS 5
+
+/* server side request timeout for file upload tasks (in milliseconds) */
+#define CONFIG_MMS_SERVER_REQUEST_TIMEOUT_MS 2000
 
 /* Definition of supported services */
 #define MMS_DEFAULT_PROFILE 1

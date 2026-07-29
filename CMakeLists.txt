@@ -12,7 +12,7 @@ ENABLE_TESTING()
 
 set(LIB_VERSION_MAJOR "1")
 set(LIB_VERSION_MINOR "6")
-set(LIB_VERSION_PATCH "1")
+set(LIB_VERSION_PATCH "2")
 set(LIB_VERSION "${LIB_VERSION_MAJOR}.${LIB_VERSION_MINOR}.${LIB_VERSION_PATCH}")
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/third_party/cmake/modules/")
@@ -57,6 +57,12 @@ option(CONFIG_IEC61850_L2_SMV "Build with support for L2 SMV (winpcap required o
 option(CONFIG_IEC61850_R_GOOSE "Build with support for R-GOOSE (mbedtls required)" ON)
 option(CONFIG_IEC61850_R_SMV "Build with support for R-SMV (mbedtls required)" ON)
 option(CONFIG_IEC61850_SNTP_CLIENT "Build with SNTP client code" ON)
+
+# Option to enable test-only instrumentation APIs (artificial delays, etc.)
+option(LIB61850_ENABLE_TEST_API "Enable test-only instrumentation APIs (e.g. artificial delays)" OFF)
+if(LIB61850_ENABLE_TEST_API)
+    add_compile_definitions(LIB61850_ENABLE_TEST_API)
+endif()
 
 set(CONFIG_IEC61850_SG_RESVTMS 300 CACHE STRING "Configure the maximum number of SG RESVTMS")
 
@@ -229,6 +235,12 @@ if(BUILD_EXAMPLES)
 endif(BUILD_EXAMPLES)
 
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/src)
+
+# Build tests if requested
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_LIST_DIR}/tests)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/tests)
+endif(BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_LIST_DIR}/tests)
 
 install(FILES ${API_HEADERS} DESTINATION include/libiec61850 COMPONENT Development)
 

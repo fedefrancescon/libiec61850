@@ -1,7 +1,7 @@
 /*
  *  mms_server_connection.c
  *
- *  Copyright 2013-2022 Michael Zillgith
+ *  Copyright 2013-2026 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -154,6 +154,12 @@ handleConfirmedRequestPdu(
 
         if ((tag & 0x1f) == 0x1f)
         {
+            if (bufPos >= maxBufPos)
+            {
+                mmsMsg_createMmsRejectPdu(&invokeId, MMS_ERROR_REJECT_INVALID_PDU, response);
+                return; /* malformed message */
+            }
+
             extendedTag = true;
             tag = buffer[bufPos++];
         }
@@ -318,7 +324,7 @@ handleConfirmedRequestPdu(
 
 #if (MMS_STATUS_SERVICE == 1)
             case 0x80: /* status-request */
-                mmsServer_handleStatusRequest(self, buffer, bufPos, invokeId, response);
+                mmsServer_handleStatusRequest(self, buffer, bufPos, bufPos + length, invokeId, response);
                 break;
 #endif /* MMS_STATUS_SERVICE == 1 */
 
@@ -534,6 +540,12 @@ handleConfirmedResponsePdu(
 
         if ((tag & 0x1f) == 0x1f)
         {
+            if (bufPos >= maxBufPos)
+            {
+                mmsMsg_createMmsRejectPdu(&invokeId, MMS_ERROR_REJECT_INVALID_PDU, response);
+                return; /* malformed message */
+            }
+
             extendedTag = true;
             tag = buffer[bufPos++];
         }
@@ -646,6 +658,7 @@ handleConfirmedResponsePdu(
                         if(fileTask->fileHandle)
                         {
                             FileSystem_closeFile(fileTask->fileHandle);
+                            fileTask->fileHandle = NULL;
                         }
 
                         fileTask->state = MMS_FILE_UPLOAD_STATE_SEND_OBTAIN_FILE_RESPONSE;
@@ -829,6 +842,25 @@ MmsServerConnection_destroy(MmsServerConnection self)
 #endif
 
 #if (MMS_DYNAMIC_DATA_SETS == 1)
+    /* notify IEC 61850 layer BEFORE destroying named variable lists */
+    if (self->namedVariableLists)
+    {
+        LinkedList element = LinkedList_getNext(self->namedVariableLists);
+
+        while (element)
+        {
+            MmsNamedVariableList variableList = (MmsNamedVariableList)element->data;
+
+            if (variableList && variableList->name)
+            {
+                mmsServer_callVariableListChangedHandler(MMS_VARLIST_DELETE, MMS_ASSOCIATION_SPECIFIC,
+                                                            NULL, /* domain (NULL for aa-specific) */
+                                                            variableList->name, self);
+            }
+            element = LinkedList_getNext(element);
+        }
+    }
+
     LinkedList_destroyDeep(self->namedVariableLists, (LinkedListValueDeleteFunction) MmsNamedVariableList_destroy);
 #endif
 

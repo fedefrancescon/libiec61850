@@ -296,7 +296,7 @@ addToOutstandingCalls(MmsConnection self, uint32_t invokeId, eMmsOutstandingCall
         {
             self->outstandingCalls[i].isUsed = true;
             self->outstandingCalls[i].invokeId = invokeId;
-            self->outstandingCalls[i].timeout = Hal_getTimeInMs() + self->requestTimeout;
+            self->outstandingCalls[i].timeout = Hal_getMonotonicTimeInMs() + self->requestTimeout;
             self->outstandingCalls[i].type = type;
             self->outstandingCalls[i].userCallback = userCallback;
             self->outstandingCalls[i].userParameter = userParameter;
@@ -1083,7 +1083,7 @@ mmsIsoCallback(IsoIndication indication, void* parameter, ByteBuffer* payload)
     {
         /* check timeouts */
 
-        uint64_t currentTime = Hal_getTimeInMs();
+        uint64_t currentTime = Hal_getMonotonicTimeInMs();
 
         int i = 0;
 
@@ -1171,7 +1171,7 @@ mmsIsoCallback(IsoIndication indication, void* parameter, ByteBuffer* payload)
         return false;
     }
 
-    if (payload != NULL) 
+    if (payload != NULL)
     {
         if (ByteBuffer_getSize(payload) < 1) {
             return false;
@@ -1634,20 +1634,16 @@ MmsConnection_createInternal(TLSConfiguration tlsConfig, bool createThread)
 
         self->connectTimeout = CONFIG_MMS_CONNECTION_DEFAULT_CONNECT_TIMEOUT;
 
-        self->isoClient = IsoClientConnection_create(self->isoParameters, (IsoIndicationCallback) mmsIsoCallback, (void*) self);
-
-#if (CONFIG_MMS_SUPPORT_TLS == 1)
-        if (tlsConfig) {
-            IsoConnectionParameters_setTlsConfiguration(self->isoParameters, tlsConfig);
-        }
-#else
-        (void)tlsConfig;
-#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
+        self->isoClient = IsoClientConnection_create(tlsConfig, self->isoParameters, (IsoIndicationCallback) mmsIsoCallback, (void*) self);
 
 #if (CONFIG_MMS_THREADLESS_STACK == 0)
         self->createThread = createThread;
         self->connectionHandlingThread = NULL;
         self->connectionThreadRunning = false;
+#endif
+
+#if defined(LIB61850_ENABLE_TEST_API)
+        self->fileReadArtificialDelayMs = 0; /* default no artificial delay */
 #endif
     }
 
@@ -1736,6 +1732,19 @@ MmsConnection_setFilestoreBasepath(MmsConnection self, const char* basepath)
 #endif
 #endif
 }
+
+#if defined(LIB61850_ENABLE_TEST_API)
+void
+MmsConnection_setFileReadArtificialDelay(MmsConnection self, uint32_t delayMs)
+{
+#if (MMS_OBTAIN_FILE_SERVICE == 1)
+    self->fileReadArtificialDelayMs = delayMs;
+#else
+    (void)self;
+    (void)delayMs;
+#endif
+}
+#endif
 
 char*
 MmsConnection_getFilestoreBasepath(MmsConnection self)
@@ -1839,6 +1848,12 @@ MmsConnection_getMmsConnectionParameters(MmsConnection self)
     return self->parameters;
 }
 
+void
+MmsConnection_setTLSConfiguration(MmsConnection self, TLSConfiguration tlsConfig)
+{
+    IsoClientConnection_setTLSConfiguration(self->isoClient, tlsConfig);
+}
+
 struct connectParameters
 {
     Semaphore sem;
@@ -1922,7 +1937,7 @@ MmsConnection_connectAsync(MmsConnection self, MmsError* mmsError, const char* s
     if (serverPort == -1)
     {
 #if (CONFIG_MMS_SUPPORT_TLS == 1)
-        if (self->isoParameters->tlsConfiguration)
+        if (IsoClientConnection_getTLSConfiguration(self->isoClient))
             serverPort = 3782;
         else
             serverPort = 102;
@@ -2013,9 +2028,9 @@ MmsConnection_abort(MmsConnection self, MmsError* mmsError)
     {
         IsoClientConnection_abortAsync(self->isoClient);
 
-        uint64_t timeout = Hal_getTimeInMs() + self->requestTimeout;
+        uint64_t timeout = Hal_getMonotonicTimeInMs() + self->requestTimeout;
 
-        while (Hal_getTimeInMs() < timeout)
+        while (Hal_getMonotonicTimeInMs() < timeout)
         {
             if (getConnectionState(self) == MMS_CONNECTION_STATE_CLOSED)
             {
@@ -2027,7 +2042,7 @@ MmsConnection_abort(MmsConnection self, MmsError* mmsError)
             }
         }
     }
-    
+
     if (success == false)
     {
         IsoClientConnection_close(self->isoClient);
@@ -2100,7 +2115,7 @@ MmsConnection_concludeAsync(MmsConnection self, MmsError* mmsError, MmsConnectio
 
     self->concludeHandler = handler;
     self->concludeHandlerParameter = parameter;
-    self->concludeTimeout = Hal_getTimeInMs() + self->requestTimeout;
+    self->concludeTimeout = Hal_getMonotonicTimeInMs() + self->requestTimeout;
 
     IsoClientConnection_sendMessage(self->isoClient, concludeMessage);
 

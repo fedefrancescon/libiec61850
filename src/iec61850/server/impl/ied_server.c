@@ -781,7 +781,7 @@ IedServer_destroy(IedServer self)
 {
     if (self)
     {
-    /* Stop server if running */
+        /* Stop server if running */
         if (self->running)
         {
 #if (CONFIG_MMS_THREADLESS_STACK == 1)
@@ -897,7 +897,13 @@ IedServer_start(IedServer self, int tcpPort)
 bool
 IedServer_isRunning(IedServer self)
 {
-    return MmsServer_isRunning(self->mmsServer);
+    if (self->running)
+        return true;
+
+    if (self->mmsServer)
+        return MmsServer_isRunning(self->mmsServer);
+
+    return false;
 }
 
 IedModel*
@@ -938,6 +944,12 @@ IedServer_setFilestoreBasepath(IedServer self, const char* basepath)
 }
 
 void
+IedServer_setRequestTimeout(IedServer self, int32_t timeoutMs)
+{
+    MmsServer_setRequestTimeout(self->mmsServer, timeoutMs);
+}
+
+void
 IedServer_setLocalIpAddress(IedServer self, const char* localIpAddress)
 {
     if (self->localIpAddress)
@@ -948,6 +960,11 @@ IedServer_setLocalIpAddress(IedServer self, const char* localIpAddress)
     MmsServer_setLocalIpAddress(self->mmsServer, self->localIpAddress);
 }
 
+void
+IedServer_setTLSConfiguration(IedServer self, TLSConfiguration tlsConfiguration)
+{
+    MmsServer_setTLSConfiguration(self->mmsServer, tlsConfiguration);
+}
 
 void
 IedServer_startThreadless(IedServer self, int tcpPort)
@@ -1351,6 +1368,8 @@ IedServer_updateAttributeValue(IedServer self, DataAttribute* dataAttribute, Mms
         {
             /* Special treatment because of transient option */
             IedServer_updateBooleanAttributeValue(self, dataAttribute, MmsValue_getBoolean(value));
+
+            return;
         }
         else
         {
@@ -1761,6 +1780,40 @@ IedServer_disableGoosePublishing(IedServer self)
 #endif /* (CONFIG_INCLUDE_GOOSE_SUPPORT == 1) */
 }
 
+#if (CONFIG_INCLUDE_GOOSE_SUPPORT == 1)
+
+void
+IedServer_startGoosePublishing(IedServer self)
+{
+    if (self->running)
+        return;
+
+    MmsMapping_enableGoosePublishing(self->mmsMapping);
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+    MmsMapping_startEventWorkerThread(self->mmsMapping);
+#endif
+
+    self->running = true;
+}
+
+void
+IedServer_stopGoosePublishing(IedServer self)
+{
+    if (!self->running)
+        return;
+
+    self->running = false;
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+    MmsMapping_stopEventWorkerThread(self->mmsMapping);
+#endif
+
+    MmsMapping_disableGoosePublishing(self->mmsMapping);
+}
+
+#endif /* (CONFIG_INCLUDE_GOOSE_SUPPORT == 1) */
+
 void
 IedServer_setWriteAccessPolicy(IedServer self, FunctionalConstraint fc, AccessPolicy policy)
 {
@@ -1809,6 +1862,15 @@ IedServer_setWriteAccessPolicy(IedServer self, FunctionalConstraint fc, AccessPo
         default: /* ignore - request is invalid */
             break;
         }
+    }
+}
+
+void
+IedServer_handleWriteAccessGlobally(IedServer self, WriteAccessHandler handler, void* parameter)
+{
+    if (self && self->mmsMapping)
+    {
+        MmsMapping_installGlobalWriteAccessHandler(self->mmsMapping, handler, parameter);
     }
 }
 

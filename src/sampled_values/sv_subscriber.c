@@ -81,8 +81,12 @@ struct sSVSubscriber
 
 struct sSVSubscriber_ASDU
 {
-    char* svId;
-    char* datSet;
+    char svIdBuf[130];   /* copy of svId - only copied when the user requests the svId */
+    char datSetBuf[130]; /* copy of datSet - only copied when the user requests the datSet */
+    char* svId;          /* pointer to the start of the svId in the ASDU buffer */
+    char* datSet;        /* pointer to the start of the datSet in the ASDU buffer */
+    uint8_t svIdSize;    /* size of the svId in the ASDU buffer */
+    uint8_t datSetSize;  /* size of the datSet in the ASDU buffer */
 
     uint8_t* smpCnt;
     uint8_t* confRev;
@@ -317,6 +321,15 @@ SVReceiver_stop(SVReceiver self)
     }
 }
 
+static void
+parseSVMessage(SVReceiver self, uint8_t* buffer, int numbytes);
+
+void
+SVReceiver_handleL2Message(SVReceiver self, uint8_t* buffer, int size)
+{
+    parseSVMessage(self, buffer, size);
+}
+
 void
 SVReceiver_destroy(SVReceiver self)
 {
@@ -329,7 +342,8 @@ SVReceiver_destroy(SVReceiver self)
         GLOBAL_FREEMEM(self->interfaceId);
 
 #if (CONFIG_MMS_THREADLESS_STACK == 0)
-    if (self->thread) {
+    if (self->thread)
+    {
         Thread_destroy(self->thread);
         self->thread = NULL;
     }
@@ -399,13 +413,25 @@ SVReceiver_stopThreadless(SVReceiver self)
 }
 
 static void
+invalidFieldSize(const char* fieldName, int expectedSize, int actualSize)
+{
+    if (DEBUG_SV_SUBSCRIBER)
+        printf("SV_SUBSCRIBER: Invalid %s size: expected %d, got %d\n", fieldName, expectedSize, actualSize);
+}
+
+static void
+fieldTooLong(const char* fieldName, int maxSize, int actualSize)
+{
+    if (DEBUG_SV_SUBSCRIBER)
+        printf("SV_SUBSCRIBER: %s too long: max %d, got %d\n", fieldName, maxSize, actualSize);
+}
+
+static void
 parseASDU(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, int length)
 {
     (void)self;
 
     int bufPos = 0;
-    int svIdLength = 0;
-    int datSetLength = 0;
 
     struct sSVSubscriber_ASDU asdu;
     memset(&asdu, 0, sizeof(struct sSVSubscriber_ASDU));
@@ -423,36 +449,71 @@ parseASDU(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, int length)
             return;
         }
 
+        if (bufPos + elementLength > length)
+        {
+            if (DEBUG_SV_SUBSCRIBER) printf("SV_SUBSCRIBER: Malformed message: element length exceeds buffer length!\n");
+            return;
+        }
+
         switch (tag)
         {
         case 0x80:
-            asdu.svId = (char*) (buffer + bufPos);
-            svIdLength = elementLength;
+            if (elementLength > 129)
+            {
+                return fieldTooLong("svId", 129, elementLength);
+            }
+            else
+            {
+                asdu.svId = (char*) (buffer + bufPos);
+                asdu.svIdSize = elementLength;
+            }
             break;
 
         case 0x81:
-            asdu.datSet = (char*) (buffer + bufPos);
-            datSetLength = elementLength;
+            if (elementLength > 129)
+            {
+                return fieldTooLong("datSet", 129, elementLength);
+            }
+            else
+            {
+                asdu.datSet = (char*) (buffer + bufPos);
+                asdu.datSetSize = elementLength;
+            }
             break;
 
         case 0x82:
-            asdu.smpCnt = buffer + bufPos;
+            if (elementLength != 2)
+                return invalidFieldSize("SmpCnt", 2, elementLength);
+            else
+                asdu.smpCnt = buffer + bufPos;
             break;
 
         case 0x83:
-            asdu.confRev = buffer + bufPos;
+            if (elementLength != 4)
+                return invalidFieldSize("ConfRev", 4, elementLength);
+            else
+                asdu.confRev = buffer + bufPos;
             break;
 
         case 0x84:
-            asdu.refrTm = buffer + bufPos;
+            if (elementLength != 8)
+                return invalidFieldSize("RefrTm", 8, elementLength);
+            else
+                asdu.refrTm = buffer + bufPos;
             break;
 
         case 0x85:
-            asdu.smpSynch = buffer + bufPos;
+            if (elementLength != 1)
+                return invalidFieldSize("SmpSynch", 1, elementLength);
+            else
+                asdu.smpSynch = buffer + bufPos;
             break;
 
         case 0x86:
-            asdu.smpRate = buffer + bufPos;
+            if (elementLength != 2)
+                return invalidFieldSize("SmpRate", 2, elementLength);
+            else
+                asdu.smpRate = buffer + bufPos;
             break;
 
         case 0x87:
@@ -461,7 +522,10 @@ parseASDU(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, int length)
             break;
 
         case 0x88:
-            asdu.smpMod = buffer + bufPos;
+            if (elementLength != 1)
+                return invalidFieldSize("SmpMod", 1, elementLength);
+            else
+                asdu.smpMod = buffer + bufPos;
             break;
 
         default: /* ignore unknown tag */
@@ -472,21 +536,19 @@ parseASDU(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, int length)
         bufPos += elementLength;
     }
 
-    if (asdu.svId != NULL)
-        asdu.svId[svIdLength] = 0;
-    if (asdu.datSet != NULL)
-        asdu.datSet[datSetLength] = 0;
-    
     if (DEBUG_SV_SUBSCRIBER)
     {
         printf("SV_SUBSCRIBER:   SV ASDU: ----------------\n");
         printf("SV_SUBSCRIBER:     DataLength: %d\n", asdu.dataBufferLength);
-        printf("SV_SUBSCRIBER:     SvId: %s\n", asdu.svId);
+        {
+            const char* svIdStr = SVSubscriber_ASDU_getSvId(&asdu);
+            printf("SV_SUBSCRIBER:     SvId: %s\n", svIdStr ? svIdStr : "(null)");
+        }
         printf("SV_SUBSCRIBER:     SmpCnt: %u\n", SVSubscriber_ASDU_getSmpCnt(&asdu));
         printf("SV_SUBSCRIBER:     ConfRev: %u\n", SVSubscriber_ASDU_getConfRev(&asdu));
-        
+
         if (SVSubscriber_ASDU_hasDatSet(&asdu))
-            printf("SV_SUBSCRIBER:     DatSet: %s\n", asdu.datSet);
+            printf("SV_SUBSCRIBER:     DatSet: %s\n", SVSubscriber_ASDU_getDatSet(&asdu));
 
         if (SVSubscriber_ASDU_hasRefrTm(&asdu))
 #ifndef _MSC_VER
@@ -526,6 +588,12 @@ parseSequenceOfASDU(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, i
             return;
         }
 
+        if (bufPos + elementLength > length)
+        {
+            /* defensive addition: already checked in BerDecoder_decodeLength */
+            return;
+        }
+
         switch (tag)
         {
         case 0x30:
@@ -544,6 +612,12 @@ parseSequenceOfASDU(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, i
 static void
 parseSVPayload(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, int apduLength)
 {
+    if (apduLength < 1)
+    {
+        if (DEBUG_SV_SUBSCRIBER) printf("SV_SUBSCRIBER: Invalid APDU length!\n");
+        return;
+    }
+
     int bufPos = 0;
 
     if (buffer[bufPos++] == 0x60)
@@ -558,6 +632,12 @@ parseSVPayload(SVReceiver self, SVSubscriber subscriber, uint8_t* buffer, int ap
         }
 
         int svEnd = bufPos + elementLength;
+
+        if (svEnd > apduLength)
+        {
+            /* defensive addition: already checked in BerDecoder_decodeLength */
+            return;
+        }
 
         while (bufPos < svEnd)
         {
@@ -598,7 +678,8 @@ exit_error:
 static void
 handleSVApdu(SVReceiver self, uint16_t appId, uint8_t* apdu, int apduLength, uint8_t* dstAddr)
 {
-    if (DEBUG_SV_SUBSCRIBER) {
+    if (DEBUG_SV_SUBSCRIBER)
+    {
         printf("SV_SUBSCRIBER: SV message: ----------------\n");
         printf("SV_SUBSCRIBER:   APPID: %u\n", appId);
         printf("SV_SUBSCRIBER:   APDU length: %i\n", apduLength);
@@ -668,10 +749,9 @@ handleSVApdu(SVReceiver self, uint16_t appId, uint8_t* apdu, int apduLength, uin
 }
 
 static void
-parseSVMessage(SVReceiver self, int numbytes)
+parseSVMessage(SVReceiver self, uint8_t* buffer, int numbytes)
 {
     int bufPos;
-    uint8_t* buffer = self->buffer;
 
     if (numbytes < 22) return;
 
@@ -687,6 +767,8 @@ parseSVMessage(SVReceiver self, int numbytes)
     {
         bufPos += 4; /* skip VLAN tag */
         headerLength += 4;
+
+        if (numbytes < 26) return;
     }
 
     /* check for SV Ethertype */
@@ -704,6 +786,13 @@ parseSVMessage(SVReceiver self, int numbytes)
 
     length = buffer[bufPos++] * 0x100;
     length += buffer[bufPos++];
+
+    if (length < 8)
+    {
+        if (DEBUG_SV_SUBSCRIBER)
+            printf("SV_SUBSCRIBER: Invalid length field\n");
+        return;
+    }
 
     /* skip reserved fields */
     bufPos += 4;
@@ -741,7 +830,7 @@ SVReceiver_tick(SVReceiver self)
 
         if (packetSize > 0)
         {
-            parseSVMessage(self, packetSize);
+            parseSVMessage(self, self->buffer, packetSize);
             return true;
         }
     }
@@ -791,6 +880,9 @@ SVSubscriber_setListener(SVSubscriber self,  SVUpdateListener listener, void* pa
 uint8_t
 SVSubscriber_ASDU_getSmpSynch(SVSubscriber_ASDU self)
 {
+    if (self->smpSynch == NULL)
+        return 0;
+
     return self->smpSynch[0];
 }
 
@@ -799,6 +891,9 @@ SVSubscriber_ASDU_getSmpCnt(SVSubscriber_ASDU self)
 {
     uint16_t retVal;
     uint8_t* valBytes = (uint8_t*) &retVal;
+
+    if (self->smpCnt == NULL)
+        return 0;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
     valBytes[0] = self->smpCnt[1];
@@ -889,13 +984,25 @@ SVSubscriber_ASDU_hasSmpMod(SVSubscriber_ASDU self)
 const char*
 SVSubscriber_ASDU_getSvId(SVSubscriber_ASDU self)
 {
-    return self->svId;
+    if (self->svId == NULL)
+        return NULL;
+
+    memcpy(self->svIdBuf, self->svId, self->svIdSize);
+    self->svIdBuf[self->svIdSize] = 0; /* ensure null termination */
+
+    return self->svIdBuf;
 }
 
 const char*
 SVSubscriber_ASDU_getDatSet(SVSubscriber_ASDU self)
 {
-    return self->datSet;
+    if (self->datSet == NULL)
+        return NULL;
+
+    memcpy(self->datSetBuf, self->datSet, self->datSetSize);
+    self->datSetBuf[self->datSetSize] = 0; /* ensure null termination */
+
+    return self->datSetBuf;
 }
 
 static inline void
@@ -912,6 +1019,9 @@ SVSubscriber_ASDU_getConfRev(SVSubscriber_ASDU self)
 {
     uint32_t retVal;
 
+    if (self->confRev == NULL)
+        return 0;
+
 #if (ORDER_LITTLE_ENDIAN == 1)
     memcpy_reverse(&retVal, self->confRev, sizeof(uint32_t));
 #else
@@ -924,6 +1034,9 @@ SVSubscriber_ASDU_getConfRev(SVSubscriber_ASDU self)
 uint8_t
 SVSubscriber_ASDU_getSmpMod(SVSubscriber_ASDU self)
 {
+    if (self->smpMod == NULL)
+        return 0;
+
     uint8_t retVal = *((uint8_t*) (self->smpMod));
 
     return retVal;
@@ -932,6 +1045,9 @@ SVSubscriber_ASDU_getSmpMod(SVSubscriber_ASDU self)
 uint16_t
 SVSubscriber_ASDU_getSmpRate(SVSubscriber_ASDU self)
 {
+    if (self->smpRate == NULL)
+        return 0;
+
     uint16_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -946,6 +1062,9 @@ SVSubscriber_ASDU_getSmpRate(SVSubscriber_ASDU self)
 int8_t
 SVSubscriber_ASDU_getINT8(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(int8_t))
+        return 0;
+
     int8_t retVal = *((int8_t*) (self->dataBuffer + index));
 
     return retVal;
@@ -954,6 +1073,9 @@ SVSubscriber_ASDU_getINT8(SVSubscriber_ASDU self, int index)
 int16_t
 SVSubscriber_ASDU_getINT16(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(int16_t))
+        return 0;
+
     int16_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -968,6 +1090,9 @@ SVSubscriber_ASDU_getINT16(SVSubscriber_ASDU self, int index)
 int32_t
 SVSubscriber_ASDU_getINT32(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(int32_t))
+        return 0;
+
     int32_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -982,6 +1107,9 @@ SVSubscriber_ASDU_getINT32(SVSubscriber_ASDU self, int index)
 int64_t
 SVSubscriber_ASDU_getINT64(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(int64_t))
+        return 0;
+
     int64_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -996,6 +1124,9 @@ SVSubscriber_ASDU_getINT64(SVSubscriber_ASDU self, int index)
 uint8_t
 SVSubscriber_ASDU_getINT8U(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(uint8_t))
+        return 0;
+
     uint8_t retVal = *((uint8_t*) (self->dataBuffer + index));
 
     return retVal;
@@ -1004,6 +1135,9 @@ SVSubscriber_ASDU_getINT8U(SVSubscriber_ASDU self, int index)
 uint16_t
 SVSubscriber_ASDU_getINT16U(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(uint16_t))
+        return 0;
+
     uint16_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -1018,6 +1152,9 @@ SVSubscriber_ASDU_getINT16U(SVSubscriber_ASDU self, int index)
 uint32_t
 SVSubscriber_ASDU_getINT32U(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(uint32_t))
+        return 0;
+
     uint32_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -1032,6 +1169,9 @@ SVSubscriber_ASDU_getINT32U(SVSubscriber_ASDU self, int index)
 uint64_t
 SVSubscriber_ASDU_getINT64U(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(uint64_t))
+        return 0;
+
     uint64_t retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -1046,6 +1186,9 @@ SVSubscriber_ASDU_getINT64U(SVSubscriber_ASDU self, int index)
 float
 SVSubscriber_ASDU_getFLOAT32(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(float))
+        return 0.0f;
+
     float retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -1060,6 +1203,9 @@ SVSubscriber_ASDU_getFLOAT32(SVSubscriber_ASDU self, int index)
 double
 SVSubscriber_ASDU_getFLOAT64(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(double))
+        return 0.0;
+
     double retVal;
 
 #if (ORDER_LITTLE_ENDIAN == 1)
@@ -1075,6 +1221,10 @@ Timestamp
 SVSubscriber_ASDU_getTimestamp(SVSubscriber_ASDU self, int index)
 {
     Timestamp retVal;
+    memset(&retVal, 0, sizeof(Timestamp));
+
+    if (index < 0 || (self->dataBufferLength - index) < (int)sizeof(retVal.val))
+        return retVal;
 
     memcpy(retVal.val, self->dataBuffer + index, sizeof(retVal.val));
 
@@ -1084,6 +1234,9 @@ SVSubscriber_ASDU_getTimestamp(SVSubscriber_ASDU self, int index)
 Quality
 SVSubscriber_ASDU_getQuality(SVSubscriber_ASDU self, int index)
 {
+    if (index < 0 || (self->dataBufferLength - index) < 4)
+        return 0;
+
     Quality retVal;
 
     uint8_t* buffer = self->dataBuffer + index;

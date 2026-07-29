@@ -3,7 +3,7 @@
  *
  *  Client side representation of the ISO stack (COTP, session, presentation, ACSE)
  *
- *  Copyright 2013-2024 Michael Zillgith
+ *  Copyright 2013-2026 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -44,7 +44,7 @@
 #else
 #define DEBUG_ISO_CLIENT 0
 #endif /*DEBUG */
-#endif /* DEBUG_ISO_SERVER */
+#endif /* DEBUG_ISO_CLIENT */
 
 #define STATE_IDLE 0
 #define STATE_CONNECTED 1
@@ -75,7 +75,9 @@ struct sIsoClientConnection
 
     volatile eIsoClientInternalState intState;
     volatile int state;
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore stateMutex;
+#endif
 
     uint32_t readTimeoutInMs; /* read timeout in ms */
     uint64_t nextReadTimeout; /* timeout value for read and connect */
@@ -83,8 +85,13 @@ struct sIsoClientConnection
     Socket socket;
 
 #if (CONFIG_MMS_SUPPORT_TLS == 1)
+    TLSConfiguration tlsConfiguration;     /* the last TLS configuration that has been provided by the user */
+    TLSConfiguration usedTlsConfiguration; /* TLS configuration that is used for the current connection */
     TLSSocket tlsSocket;
-#endif
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+    Semaphore tlsConfigMutex; /* mutex to synchronize access to TLSConfiguration */
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
 
     CotpConnection* cotpConnection;
     IsoPresentation* presentation;
@@ -96,11 +103,15 @@ struct sIsoClientConnection
     ByteBuffer* receiveBuffer;
 
     ByteBuffer* transmitPayloadBuffer;
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore transmitBufferMutex;
+#endif
 
     ByteBuffer* receivePayloadBuffer;
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore tickMutex;
+#endif
 
     uint8_t* cotpReadBuf;
     uint8_t* cotpWriteBuf;
@@ -112,9 +123,15 @@ struct sIsoClientConnection
 static void
 setState(IsoClientConnection self, int newState)
 {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->stateMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
+
     self->state = newState;
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->stateMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 }
 
 static int
@@ -122,9 +139,15 @@ getState(IsoClientConnection self)
 {
     int stateVal;
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->stateMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
+
     stateVal = self->state;
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->stateMutex);
+#endif
 
     return stateVal;
 }
@@ -142,19 +165,39 @@ getIntState(IsoClientConnection self)
 }
 
 IsoClientConnection
-IsoClientConnection_create(IsoConnectionParameters parameters, IsoIndicationCallback callback, void* callbackParameter)
+IsoClientConnection_create(TLSConfiguration tlsConfiguration, IsoConnectionParameters parameters, IsoIndicationCallback callback, void* callbackParameter)
 {
     IsoClientConnection self = (IsoClientConnection) GLOBAL_CALLOC(1, sizeof(struct sIsoClientConnection));
+
+#if (CONFIG_MMS_SUPPORT_TLS != 1)
+    (void)tlsConfiguration; /* unused when compiled without TLS support */
+#endif
 
     if (self)
     {
         self->parameters = parameters;
+
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+        if (tlsConfiguration == NULL)
+            self->tlsConfiguration = NULL;
+        else
+            self->tlsConfiguration = TLSConfiguration_claimOwnership(tlsConfiguration);
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
+
         self->callback = callback;
         self->callbackParameter = callbackParameter;
 
         self->intState = INT_STATE_IDLE;
         self->state = STATE_IDLE;
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
         self->stateMutex = Semaphore_create(1);
+        self->transmitBufferMutex = Semaphore_create(1);
+        self->tickMutex = Semaphore_create(1);
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+        self->tlsConfigMutex = Semaphore_create(1);
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 
         self->sendBuffer = (uint8_t*) GLOBAL_MALLOC(ISO_CLIENT_BUFFER_SIZE);
 
@@ -163,10 +206,6 @@ IsoClientConnection_create(IsoConnectionParameters parameters, IsoIndicationCall
         self->transmitPayloadBuffer->maxSize = ISO_CLIENT_BUFFER_SIZE;
 
         self->receivePayloadBuffer = (ByteBuffer*) GLOBAL_CALLOC(1, sizeof(ByteBuffer));
-
-        self->transmitBufferMutex = Semaphore_create(1);
-
-        self->tickMutex = Semaphore_create(1);
 
         self->receiveBuf = (uint8_t*) GLOBAL_MALLOC(ISO_CLIENT_BUFFER_SIZE);
         self->receiveBuffer = (ByteBuffer*) GLOBAL_CALLOC(1, sizeof(ByteBuffer));
@@ -189,6 +228,46 @@ IsoClientConnection_create(IsoConnectionParameters parameters, IsoIndicationCall
     }
 
     return self;
+}
+
+void
+IsoClientConnection_setTLSConfiguration(IsoClientConnection self, TLSConfiguration tlsConfig)
+{
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+    if (tlsConfig == NULL)
+        return;
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+    Semaphore_wait(self->tlsConfigMutex);
+#endif
+
+    if (self->tlsConfiguration)
+    {
+        TLSConfiguration_destroy(self->tlsConfiguration);
+    }
+
+    self->tlsConfiguration = TLSConfiguration_claimOwnership(tlsConfig);
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+    Semaphore_post(self->tlsConfigMutex);
+#endif
+
+#else
+    (void)self;
+    (void)tlsConfig;
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
+}
+
+TLSConfiguration
+IsoClientConnection_getTLSConfiguration(IsoClientConnection self)
+{
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+    return self->tlsConfiguration;
+#else
+    (void)self;
+
+    return NULL;
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
 }
 
 static bool
@@ -219,12 +298,12 @@ sendConnectionRequestMessage(IsoClientConnection self)
                 socketExtensionBuffer, socketExtensionBufferSize);
 
 #if (CONFIG_MMS_SUPPORT_TLS == 1)
-        if (self->parameters->tlsConfiguration)
+        if (self->usedTlsConfiguration)
         {
-            TLSConfiguration_setClientMode(self->parameters->tlsConfiguration);
+            TLSConfiguration_setClientMode(self->usedTlsConfiguration);
 
             /* create TLSSocket and start TLS authentication */
-            TLSSocket tlsSocket = TLSSocket_create(self->socket, self->parameters->tlsConfiguration, false);
+            TLSSocket tlsSocket = TLSSocket_create(self->socket, self->usedTlsConfiguration, false);
 
             if (tlsSocket)
                 self->cotpConnection->tlsSocket = tlsSocket;
@@ -299,7 +378,9 @@ sendAcseInitiateRequest(IsoClientConnection self)
 
     CotpConnection_sendDataMessage(self->cotpConnection, sessionBuffer);
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->transmitBufferMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 }
 
 static void
@@ -312,6 +393,12 @@ releaseSocket(IsoClientConnection self)
         {
             TLSSocket_close(self->cotpConnection->tlsSocket);
             self->cotpConnection->tlsSocket = NULL;
+        }
+
+        if (self->usedTlsConfiguration)
+        {
+            TLSConfiguration_destroy(self->usedTlsConfiguration);
+            self->usedTlsConfiguration = NULL;
         }
 #endif
 
@@ -330,7 +417,9 @@ releaseSocket(IsoClientConnection self)
 bool
 IsoClientConnection_handleConnection(IsoClientConnection self)
 {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 
     bool waits = false;
 
@@ -353,7 +442,7 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
             {
                 if (sendConnectionRequestMessage(self))
                 {
-                    self->nextReadTimeout = Hal_getTimeInMs() + self->readTimeoutInMs;
+                    self->nextReadTimeout = Hal_getMonotonicTimeInMs() + self->readTimeoutInMs;
                     nextState = INT_STATE_WAIT_FOR_COTP_CONNECT_RESP;
                 }
                 else
@@ -373,7 +462,7 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
             {
                 /* check connect timeout */
 
-                uint64_t currentTime = Hal_getTimeInMs();
+                uint64_t currentTime = Hal_getMonotonicTimeInMs();
 
                 if (currentTime > self->nextReadTimeout)
                 {
@@ -392,7 +481,7 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
 
     case INT_STATE_WAIT_FOR_COTP_CONNECT_RESP:
         {
-            uint64_t currentTime = Hal_getTimeInMs();
+            uint64_t currentTime = Hal_getMonotonicTimeInMs();
 
             if (currentTime > self->nextReadTimeout)
             {
@@ -428,7 +517,7 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
                     {
                         sendAcseInitiateRequest(self);
 
-                        self->nextReadTimeout = Hal_getTimeInMs() + self->readTimeoutInMs;
+                        self->nextReadTimeout = Hal_getMonotonicTimeInMs() + self->readTimeoutInMs;
 
                         nextState = INT_STATE_WAIT_FOR_ACSE_RESP;
                     }
@@ -453,7 +542,7 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
 
     case INT_STATE_WAIT_FOR_ACSE_RESP:
         {
-            uint64_t currentTime = Hal_getTimeInMs();
+            uint64_t currentTime = Hal_getMonotonicTimeInMs();
 
             if (currentTime > self->nextReadTimeout)
             {
@@ -670,7 +759,9 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
 
     setIntState(self, nextState);
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 
     return waits;
 }
@@ -678,7 +769,9 @@ IsoClientConnection_handleConnection(IsoClientConnection self)
 bool
 IsoClientConnection_associateAsync(IsoClientConnection self, uint32_t connectTimeoutInMs, uint32_t readTimeoutInMs)
 {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 
     /* Create socket and start connect */
 
@@ -686,7 +779,9 @@ IsoClientConnection_associateAsync(IsoClientConnection self, uint32_t connectTim
 
     if (self->socket == NULL)
     {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
         Semaphore_post(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
         return false;
     }
 
@@ -706,14 +801,35 @@ IsoClientConnection_associateAsync(IsoClientConnection self, uint32_t connectTim
     self->readTimeoutInMs = readTimeoutInMs;
 
     /* set timeout for connect */
-    self->nextReadTimeout = Hal_getTimeInMs() + connectTimeoutInMs;
+    self->nextReadTimeout = Hal_getMonotonicTimeInMs() + connectTimeoutInMs;
 
     /* Connect to Local Ip Address*/
-    if (self->parameters->localIpAddress) {
-        Socket_bind(self->socket, self->parameters->localIpAddress, self->parameters->localTcpPort);
+    if (self->parameters->localIpAddress)
+    {
+        if (Socket_bind(self->socket, self->parameters->localIpAddress, self->parameters->localTcpPort))
+        {
+            if (DEBUG_ISO_CLIENT)
+                printf("ISO_CLIENT: Socket bound to local IP address %s and port %i\n", self->parameters->localIpAddress, self->parameters->localTcpPort);
+        }
+        else
+        {
+            if (DEBUG_ISO_CLIENT)
+                printf("ISO_CLIENT: Failed to bind socket to local IP address %s and port %i\n", self->parameters->localIpAddress, self->parameters->localTcpPort);
+
+            success = false;
+
+            goto exit_function;
+        }
     }
-    
+
     if (Socket_connectAsync(self->socket, self->parameters->hostname, self->parameters->tcpPort) == false)
+    {
+        success = false;
+    }
+
+exit_function:
+
+    if (!success)
     {
         Socket_destroy(self->socket);
         self->socket = NULL;
@@ -722,12 +838,37 @@ IsoClientConnection_associateAsync(IsoClientConnection self, uint32_t connectTim
         setState(self, STATE_ERROR);
 
         IsoClientConnection_releaseTransmitBuffer(self);
-
-        success = false;
     }
-    
+    else
+    {
+        if (DEBUG_ISO_CLIENT)
+            printf("ISO_CLIENT: Started async connect to %s:%i\n", self->parameters->hostname, self->parameters->tcpPort);
+
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+        Semaphore_wait(self->tlsConfigMutex);
+#endif
+
+        if (self->tlsConfiguration)
+        {
+            if (self->usedTlsConfiguration)
+                TLSConfiguration_destroy(self->usedTlsConfiguration);
+
+            self->usedTlsConfiguration = TLSConfiguration_claimOwnership(self->tlsConfiguration);
+        }
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
+        Semaphore_post(self->tlsConfigMutex);
+#endif
+
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
+    }
+
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->tickMutex);
-    
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
+
     return success;
 }
 
@@ -766,8 +907,10 @@ IsoClientConnection_sendMessage(IsoClientConnection self, ByteBuffer* payloadBuf
             printf("ISO_CLIENT: Not connected --> cannot send message\n");
     }
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     /* release transmit buffer for use by API client */
     Semaphore_post(self->transmitBufferMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 }
 
 void
@@ -776,7 +919,9 @@ IsoClientConnection_close(IsoClientConnection self)
     if (DEBUG_ISO_CLIENT)
         printf("ISO_CLIENT: IsoClientConnection_close\n");
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 
     eIsoClientInternalState intState = getIntState(self);
 
@@ -784,13 +929,18 @@ IsoClientConnection_close(IsoClientConnection self)
     {
         setIntState(self, INT_STATE_CLOSING_CONNECTION);
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
         Semaphore_post(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 
         IsoClientConnection_handleConnection(self);
         setState(self, STATE_IDLE);
     }
-    else {
+    else
+    {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
         Semaphore_post(self->tickMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
     }
 }
 
@@ -810,7 +960,6 @@ IsoClientConnection_destroy(IsoClientConnection self)
         IsoClientConnection_close(self);
     }
 
-    /// is this required?!
     releaseSocket(self);
 
     if (self->receiveBuf != NULL)
@@ -848,9 +997,28 @@ IsoClientConnection_destroy(IsoClientConnection self)
     GLOBAL_FREEMEM(self->transmitPayloadBuffer);
     GLOBAL_FREEMEM(self->receivePayloadBuffer);
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_destroy(self->transmitBufferMutex);
     Semaphore_destroy(self->stateMutex);
     Semaphore_destroy(self->tickMutex);
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+    Semaphore_destroy(self->tlsConfigMutex);
+#endif
+
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
+
+#if (CONFIG_MMS_SUPPORT_TLS == 1)
+    if (self->tlsConfiguration)
+    {
+        TLSConfiguration_destroy(self->tlsConfiguration);
+    }
+
+    if (self->usedTlsConfiguration)
+    {
+        TLSConfiguration_destroy(self->usedTlsConfiguration);
+        self->usedTlsConfiguration = NULL;
+    }
+#endif /* (CONFIG_MMS_SUPPORT_TLS == 1) */
 
     GLOBAL_FREEMEM(self->sendBuffer);
     GLOBAL_FREEMEM(self);
@@ -887,7 +1055,9 @@ sendAbortMessage(IsoClientConnection self)
 
     CotpConnection_sendDataMessage(self->cotpConnection, sessionBuffer);
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->transmitBufferMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 }
 
 void
@@ -928,20 +1098,28 @@ IsoClientConnection_release(IsoClientConnection self)
 
     CotpConnection_sendDataMessage(self->cotpConnection, sessionBuffer);
 
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->transmitBufferMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 }
 
 ByteBuffer*
 IsoClientConnection_allocateTransmitBuffer(IsoClientConnection self)
 {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_wait(self->transmitBufferMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
+
     self->transmitPayloadBuffer->size = 0;
     self->transmitPayloadBuffer->maxSize = ISO_CLIENT_BUFFER_SIZE;
+
     return self->transmitPayloadBuffer;
 }
 
 void
 IsoClientConnection_releaseTransmitBuffer(IsoClientConnection self)
 {
+#if (CONFIG_MMS_THREADLESS_STACK != 1)
     Semaphore_post(self->transmitBufferMutex);
+#endif /* (CONFIG_MMS_THREADLESS_STACK != 1) */
 }

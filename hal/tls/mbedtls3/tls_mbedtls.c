@@ -3,7 +3,7 @@
  *
  * TLS API for TCP/IP protocol stacks
  *
- * Copyright 2017-2024 Michael Zillgith
+ * Copyright 2017-2025 Michael Zillgith
  *
  * Implementation of the TLS abstraction layer for mbedtls
  *
@@ -17,34 +17,63 @@
 #include "linked_list.h"
 #include "tls_socket.h"
 
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/entropy.h"
 #include "mbedtls/platform.h"
-#include "mbedtls/debug.h"
-#include "mbedtls/error.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/ssl.h"
-#include "mbedtls/ssl_cache.h"
+#include "mbedtls/entropy.h"
+#include "mbedtls/ctr_drbg.h"
 #include "mbedtls/x509.h"
+#include "mbedtls/ssl.h"
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/error.h"
+#include "mbedtls/debug.h"
+#include "mbedtls/ssl_cache.h"
+
+/* mbedtls stores session IDs in a 32-byte buffer (see mbedtls_ssl_session.id). */
+#define TLS_CACHE_MAX_SESSION_ID_LENGTH 32
 
 #define SEC_EVENT_ALARM 2
 #define SEC_EVENT_WARNING 1
 #define SEC_EVENT_INFO 0
 
 #ifndef CONFIG_DEBUG_TLS
-#define CONFIG_DEBUG_TLS 1
+#define CONFIG_DEBUG_TLS 0
 #endif
 
 #if (CONFIG_DEBUG_TLS == 1)
-#define DEBUG_PRINT(appId, fmt, ...) fprintf(stderr, "%s: " fmt, appId, ##__VA_ARGS__)
+#define DEBUG_PRINT(appId, fmt, ...) fprintf(stderr, "%s: " fmt, appId, ## __VA_ARGS__)
 #else
-#define DEBUG_PRINT(fmt, ...)                                                                                          \
-    do                                                                                                                 \
-    {                                                                                                                  \
-    } while (0)
+#define DEBUG_PRINT(fmt, ...) do {} while(0)
 #endif
 
 static int psaInitCounter = 0;
+
+#if __STDC_VERSION__ >= 201112L
+#include <stdatomic.h>
+#else
+#include "hal_thread.h"
+#define _TLS_OWN_CNT_SEM 1
+#endif
+
+typedef struct TLSCacheEntry
+{
+    uint64_t timestamp;
+    TLSConfigVersion version;
+    size_t sessionIdLength;
+    unsigned char sessionId[TLS_CACHE_MAX_SESSION_ID_LENGTH];
+    unsigned char *serializedSession;
+    size_t serializedSessionLength;
+    struct TLSCacheEntry *next;
+} TLSCacheEntry;
+
+typedef struct TLSVersionedCache
+{
+    TLSCacheEntry *chain;
+    int timeout; /* timeout in milliseconds */
+    int max_entries;
+    Semaphore mutex;
+    bool initialized;
+} TLSVersionedCache;
+
+struct TLSCacheAccessor;
 
 struct sTLSConfiguration
 {
@@ -62,11 +91,15 @@ struct sTLSConfiguration
     LinkedList /* <mbedtls_x509_crt*> */ allowedCertificates;
 
     /* session cache for server */
-    mbedtls_ssl_cache_context cache;
+    TLSVersionedCache serverSessionCache;
 
     /* client side cached session */
     mbedtls_ssl_session* savedSession;
     uint64_t savedSessionTime;
+    TLSConfigVersion savedSessionVersion; /* TLS version of the saved session */
+
+    /* mutex protecting configuration data (CRL, savedSession, etc.) */
+    Semaphore configMutex;
 
     bool chainValidation;
     bool allowOnlyKnownCertificates;
@@ -81,6 +114,9 @@ struct sTLSConfiguration
     /* TLS maximum version allowed (default: TLS_VERSION_NOT_SELECTED) */
     TLSConfigVersion maxVersion;
 
+    /* minimum public key length in bits */
+    int minKeyLengthInBits;
+
     TLSConfiguration_EventHandler eventHandler;
     void* eventHandlerParameter;
 
@@ -92,8 +128,17 @@ struct sTLSConfiguration
     bool useSessionResumption;
     int sessionResumptionInterval; /* session resumption interval in seconds */
 
+#ifdef _TLS_OWN_CNT_SEM
+    Semaphore ownerCountMutex;
+    int ownerCount;
+#else
+    _Atomic(int) ownerCount;
+#endif /* _TLS_OWN_CNT_SEM */
+
     int* ciphersuites;
     int maxCiphersuites;
+
+    int maxCertificateSizeInBytes;
 };
 
 struct sTLSSocket
@@ -111,6 +156,28 @@ struct sTLSSocket
 
     /* time of the last CRL update */
     uint64_t crlUpdated;
+
+    /* flag to suppress repeated handshake failures after certificate validation failure */
+    bool certValidationFailed;
+
+    /* cached certificate verification flags from last verifyCertificate callback */
+    uint32_t lastCertVerifyFlags;
+
+    bool versionMismatchDetected;
+    struct TLSCacheAccessor* cacheAccessor;
+    bool handshakeInProgress;
+
+    /* Timestamp of the most recent TLSSocket_read or TLSSocket_write call.
+     * Used by TLSSocket_tick to detect idle connections and avoid initiating
+     * renegotiation when the read/write path will do it instead. */
+    uint64_t lastActivityTime;
+};
+
+struct TLSCacheAccessor
+{
+    TLSConfiguration configuration;
+    TLSVersionedCache* cache;
+    TLSSocket socket;
 };
 
 static void
@@ -121,6 +188,350 @@ raiseSecurityEvent(TLSConfiguration config, TLSEventLevel eventCategory, int eve
     {
         config->eventHandler(config->eventHandlerParameter, eventCategory, eventCode, message, (TLSConnection)socket);
     }
+}
+
+static TLSConfigVersion
+getTLSVersion(mbedtls_ssl_context* ssl)
+{
+    mbedtls_ssl_protocol_version version = mbedtls_ssl_get_version_number(ssl);
+
+    switch (version)
+    {
+    case MBEDTLS_SSL_VERSION_TLS1_2:
+        return TLS_VERSION_TLS_1_2;
+    case MBEDTLS_SSL_VERSION_TLS1_3:
+        return TLS_VERSION_TLS_1_3;
+    case MBEDTLS_SSL_VERSION_UNKNOWN:
+    default:
+        return TLS_VERSION_NOT_SELECTED;
+    }
+}
+
+static void
+tlsVersionedCacheInit(TLSVersionedCache *cache)
+{
+    if (cache == NULL || cache->initialized)
+        return;
+
+    cache->chain = NULL;
+    cache->timeout = MBEDTLS_SSL_CACHE_DEFAULT_TIMEOUT * 1000; /* convert to milliseconds */
+    cache->max_entries = MBEDTLS_SSL_CACHE_DEFAULT_MAX_ENTRIES;
+
+    cache->mutex = Semaphore_create(1);
+
+    cache->initialized = true;
+}
+
+static void
+tlsVersionedCacheFree(TLSVersionedCache *cache)
+{
+    if (cache == NULL || cache->initialized == false)
+        return;
+
+    TLSCacheEntry *cur = cache->chain;
+
+    while (cur != NULL)
+    {
+        TLSCacheEntry *prev = cur;
+        cur = cur->next;
+
+        if (prev->serializedSession)
+            mbedtls_free(prev->serializedSession);
+
+        mbedtls_free(prev);
+    }
+
+    cache->chain = NULL;
+
+    Semaphore_destroy(cache->mutex);
+
+    cache->initialized = false;
+}
+
+static int
+tlsVersionedCacheGet(TLSVersionedCache *cache, mbedtls_ssl_session *session, TLSConfigVersion *versionOut)
+{
+    if (cache == NULL || cache->initialized == false)
+        return 1;
+
+    int ret = 1;
+
+    uint64_t t = Hal_getMonotonicTimeInMs();
+
+    Semaphore_wait(cache->mutex);
+
+    TLSCacheEntry *cur = cache->chain;
+
+    while (cur != NULL)
+    {
+        if (cache->timeout != 0 && (uint64_t)(t - cur->timestamp) > cache->timeout)
+        {
+            cur = cur->next;
+            continue;
+        }
+
+        if (mbedtls_ssl_session_get_id_len(session) == cur->sessionIdLength &&
+            memcmp(mbedtls_ssl_session_get_id(session), cur->sessionId, cur->sessionIdLength) == 0)
+        {
+            if (cur->serializedSession == NULL || cur->serializedSessionLength == 0)
+            {
+                ret = 1;
+                goto exit;
+            }
+
+            mbedtls_ssl_session_free(session);
+            mbedtls_ssl_session_init(session);
+
+            if (mbedtls_ssl_session_load(session,
+                    cur->serializedSession,
+                    cur->serializedSessionLength) != 0)
+            {
+                ret = 1;
+                goto exit;
+            }
+
+            if (versionOut)
+                *versionOut = cur->version;
+
+            ret = 0;
+            goto exit;
+        }
+
+        cur = cur->next;
+    }
+
+exit:
+    Semaphore_post(cache->mutex);
+
+    return ret;
+}
+
+static int
+tlsVersionedCacheSet(TLSVersionedCache *cache, const mbedtls_ssl_session *session, TLSConfigVersion version)
+{
+    if (cache == NULL || cache->initialized == false)
+        return 1;
+
+    if (session == NULL || mbedtls_ssl_session_get_id_len(session) == 0 ||
+        mbedtls_ssl_session_get_id_len(session) > TLS_CACHE_MAX_SESSION_ID_LENGTH)
+    {
+        return 1;
+    }
+
+    int ret = 1;
+
+    uint64_t t = Hal_getMonotonicTimeInMs();
+    uint64_t oldest = 0;
+    TLSCacheEntry *old = NULL;
+
+    TLSCacheEntry *cur = cache->chain;
+    TLSCacheEntry *prev = NULL;
+    int count = 0;
+
+    Semaphore_wait(cache->mutex);
+
+    while (cur != NULL)
+    {
+        count++;
+
+        if ((cache->timeout != 0) && ((t - cur->timestamp) > cache->timeout))
+        {
+            cur->timestamp = t;
+            break;
+        }
+
+        if ((mbedtls_ssl_session_get_id_len(session) == cur->sessionIdLength) &&
+            (memcmp(mbedtls_ssl_session_get_id(session), cur->sessionId, cur->sessionIdLength) == 0))
+        {
+            break;
+        }
+
+        if ((oldest == 0) || (cur->timestamp < oldest))
+        {
+            oldest = cur->timestamp;
+            old = cur;
+        }
+
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (cur == NULL)
+    {
+        if (count >= cache->max_entries)
+        {
+            if (old == NULL)
+            {
+                ret = 1;
+                goto exit;
+            }
+
+            cur = old;
+        }
+        else
+        {
+            cur = (TLSCacheEntry*)GLOBAL_CALLOC(1, sizeof(TLSCacheEntry));
+            if (cur == NULL)
+            {
+                ret = 1;
+                goto exit;
+            }
+
+            if (prev == NULL)
+                cache->chain = cur;
+            else
+                prev->next = cur;
+        }
+
+        cur->timestamp = t;
+    }
+
+    size_t requiredLength = 0;
+    int saveRet = mbedtls_ssl_session_save(session, NULL, 0, &requiredLength);
+    if (saveRet != MBEDTLS_ERR_SSL_BUFFER_TOO_SMALL && saveRet != 0)
+    {
+        ret = 1;
+        goto exit;
+    }
+
+    if (requiredLength == 0)
+    {
+        ret = 1;
+        goto exit;
+    }
+
+    unsigned char* buffer = (unsigned char*)GLOBAL_CALLOC(1, requiredLength);
+    if (buffer == NULL)
+    {
+        ret = 1;
+        goto exit;
+    }
+
+    size_t writtenLength = requiredLength;
+    saveRet = mbedtls_ssl_session_save(session, buffer, requiredLength, &writtenLength);
+    if (saveRet != 0)
+    {
+        mbedtls_free(buffer);
+        ret = 1;
+        goto exit;
+    }
+
+    unsigned char *oldBuffer = cur->serializedSession;
+
+    cur->serializedSession = buffer;
+    cur->serializedSessionLength = writtenLength;
+    cur->sessionIdLength = mbedtls_ssl_session_get_id_len(session);
+    memcpy(cur->sessionId, mbedtls_ssl_session_get_id(session), mbedtls_ssl_session_get_id_len(session));
+    cur->version = version;
+    if (oldBuffer)
+        mbedtls_free(oldBuffer);
+    ret = 0;
+
+exit:
+    Semaphore_post(cache->mutex);
+
+    return ret;
+}
+
+static void
+tlsVersionedCacheInvalidateAll(TLSVersionedCache *cache)
+{
+    if (cache == NULL || cache->initialized == false)
+        return;
+
+    Semaphore_wait(cache->mutex);
+
+    TLSCacheEntry *cur = cache->chain;
+    while (cur != NULL)
+    {
+        cur->timestamp = 0;
+        cur = cur->next;
+    }
+
+    Semaphore_post(cache->mutex);
+}
+
+static struct TLSCacheAccessor*
+tlsCacheAccessorCreate(TLSConfiguration configuration, TLSSocket socket)
+{
+    if (configuration == NULL || socket == NULL)
+        return NULL;
+
+    struct TLSCacheAccessor* accessor = (struct TLSCacheAccessor*) GLOBAL_CALLOC(1, sizeof(struct TLSCacheAccessor));
+
+    if (accessor == NULL)
+        return NULL;
+
+    accessor->configuration = configuration;
+    accessor->cache = &(configuration->serverSessionCache);
+    accessor->socket = socket;
+
+    return accessor;
+}
+
+static void
+tlsCacheAccessorDestroy(struct TLSCacheAccessor* accessor)
+{
+    if (accessor)
+        GLOBAL_FREEMEM(accessor);
+}
+
+static int
+tls_cache_get_callback(void *data, unsigned char const *session_id,
+                                   size_t session_id_len,
+                                   mbedtls_ssl_session *session)
+{
+    struct TLSCacheAccessor* accessor = (struct TLSCacheAccessor*) data;
+
+    if (accessor == NULL || accessor->cache == NULL)
+        return 1;
+
+    TLSConfigVersion cachedVersion = TLS_VERSION_NOT_SELECTED;
+    int ret = tlsVersionedCacheGet(accessor->cache, session, &cachedVersion);
+
+    if (ret != 0)
+        return ret;
+
+    TLSSocket socket = accessor->socket;
+    TLSConfigVersion requestedVersion = TLS_VERSION_NOT_SELECTED;
+
+    if (socket)
+        requestedVersion = getTLSVersion(&(socket->ssl));
+
+    if (cachedVersion != TLS_VERSION_NOT_SELECTED &&
+        requestedVersion != TLS_VERSION_NOT_SELECTED &&
+        cachedVersion != requestedVersion)
+    {
+        if (socket && socket->versionMismatchDetected == false)
+        {
+            socket->versionMismatchDetected = true;
+            raiseSecurityEvent(accessor->configuration, TLS_SEC_EVT_INCIDENT,
+                TLS_EVENT_CODE_ALM_TLS_VERSION_CHANGE,
+                "Alarm: TLS version change detected", socket);
+        }
+
+        return 1;
+    }
+
+    return 0;
+}
+
+static int
+tls_cache_set_callback(void *data, unsigned char const *session_id,
+                                   size_t session_id_len,
+                                   const mbedtls_ssl_session *session)
+{
+    struct TLSCacheAccessor* accessor = (struct TLSCacheAccessor*) data;
+
+    if (accessor == NULL || accessor->cache == NULL)
+        return 0;
+
+    TLSConfigVersion version = TLS_VERSION_NOT_SELECTED;
+
+    if (accessor->socket)
+        version = getTLSVersion(&(accessor->socket->ssl));
+
+    return tlsVersionedCacheSet(accessor->cache, session, version);
 }
 
 static bool
@@ -135,14 +546,47 @@ compareCertificates(mbedtls_x509_crt* crt1, mbedtls_x509_crt* crt2)
     return false;
 }
 
+static bool
+crlAvailableForCert(TLSConfiguration cfg, const mbedtls_x509_crt* crt)
+{
+    const mbedtls_x509_crl* crl = NULL;
+    bool found = false;
+
+    if (cfg->configMutex)
+        Semaphore_wait(cfg->configMutex);
+
+    crl = &(cfg->crl);
+
+    while (crl && crl->version != 0)
+    {
+        if (crl->issuer_raw.len == crt->issuer_raw.len &&
+            memcmp(crl->issuer_raw.p, crt->issuer_raw.p, crl->issuer_raw.len) == 0)
+        {
+            found = true;
+            break;
+        }
+        crl = crl->next;
+    }
+
+    if (cfg->configMutex)
+        Semaphore_post(cfg->configMutex);
+
+    return found;
+}
+
 static int
 verifyCertificate(void* parameter, mbedtls_x509_crt* crt, int certificate_depth, uint32_t* flags)
 {
     TLSSocket self = (TLSSocket)parameter;
 
     DEBUG_PRINT("TLS", "Verify cert: depth %i\n", certificate_depth);
-
     DEBUG_PRINT("TLS", "   flags: %08x\n", *flags);
+
+    /* Cache certificate verification flags for peer certificate (depth 0) */
+    if (certificate_depth == 0)
+    {
+        self->lastCertVerifyFlags = *flags;
+    }
 
     char buffer[1024];
 
@@ -156,8 +600,37 @@ verifyCertificate(void* parameter, mbedtls_x509_crt* crt, int certificate_depth,
             *flags = 0;
     }
 
+    if (self->tlsConfig->maxCertificateSizeInBytes > 0 && crt->raw.len > (size_t)(self->tlsConfig->maxCertificateSizeInBytes))
+    {
+        raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_INCIDENT, TLS_EVENT_CODE_ALM_CERT_SIZE_EXCEEDED,
+                           "Alarm: TLS certificate size exceeded", self);
+
+        *flags |= MBEDTLS_X509_BADCERT_OTHER;
+        self->lastCertVerifyFlags = *flags;
+
+        return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+    }
+
     if (certificate_depth == 0)
     {
+        /* Get the key size in bits of the public key from the certificate */
+        size_t keyLengthBits = mbedtls_pk_get_bitlen(&crt->pk);
+
+        if (keyLengthBits < (size_t)(self->tlsConfig->minKeyLengthInBits))
+        {
+            *flags &= ~MBEDTLS_X509_BADCERT_BAD_KEY;
+            raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_INCIDENT, TLS_EVENT_CODE_ALM_INSUFFICIENT_KEY_LENGTH, "Alarm: insufficient key length", self);
+            return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED;
+        }
+        else if (keyLengthBits == (size_t)(self->tlsConfig->minKeyLengthInBits))
+        {
+            *flags &= ~MBEDTLS_X509_BADCERT_BAD_KEY;
+            raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_WARNING, TLS_EVENT_CODE_WRN_MIN_KEY_LENGTH, "Warning: minimum key length", self);
+        }
+
+        DEBUG_PRINT("TLS", "Peer public key length: %zu bits (%zu bytes) (cert: %zu bytes)\n",
+                    keyLengthBits, ((keyLengthBits + 7) / 8), crt->raw.len);
+
         if (self->tlsConfig->allowOnlyKnownCertificates)
         {
             DEBUG_PRINT("TLS", "Check against list of allowed certs\n");
@@ -198,6 +671,17 @@ verifyCertificate(void* parameter, mbedtls_x509_crt* crt, int certificate_depth,
             }
         }
 
+        if (crlAvailableForCert(self->tlsConfig, crt) == false)
+        {
+            raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_WARNING, TLS_EVENT_CODE_WRN_CRL_NOT_ACCESSIBLE,
+                               "Warning: CRL not accessible", self);
+        }
+
+        if (*flags & MBEDTLS_X509_BADCERT_BAD_MD || *flags & MBEDTLS_X509_BADCERT_BAD_PK)
+        {
+            raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_INCIDENT, TLS_EVENT_CODE_ALM_ALGO_NOT_SUPPORTED, "Alarm: Algorithm not supported", self);
+        }
+
         if (self->tlsConfig->timeValidation == false)
         {
             if (*flags & MBEDTLS_X509_BADCERT_EXPIRED)
@@ -233,19 +717,34 @@ verifyCertificate(void* parameter, mbedtls_x509_crt* crt, int certificate_depth,
             }
         }
 
-        if (self->storePeerCert)
+        if (self->storePeerCert && (*flags == 0))
         {
-            if (*flags == 0)
-            {
-                self->peerCertLength = 0;
-                self->peerCert = (uint8_t*)GLOBAL_MALLOC(crt->raw.len);
+            /* store valid certificate when this feature is configured */
 
-                if (self->peerCert)
-                {
-                    self->peerCertLength = (int)crt->raw.len;
-                    memcpy(self->peerCert, crt->raw.p, self->peerCertLength);
-                }
+            /* release previously stored certificate */
+            if (self->peerCert)
+            {
+                GLOBAL_FREEMEM(self->peerCert);
+                self->peerCert = NULL;
             }
+
+            self->peerCertLength = 0;
+            self->peerCert = (uint8_t*) GLOBAL_MALLOC(crt->raw.len);
+
+            if (self->peerCert)
+            {
+                self->peerCertLength = (int)crt->raw.len;
+                memcpy(self->peerCert, crt->raw.p, self->peerCertLength);
+            }
+        }
+    }
+    else
+    {
+        if (*flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED)
+        {
+            *flags = 0;
+            raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_INCIDENT, TLS_EVENT_CODE_ALM_CERT_NOT_TRUSTED, "Alarm: Certificate validation: CA certificate not available", self);
+            return MBEDTLS_ERR_X509_CERT_VERIFY_FAILED ;
         }
     }
 
@@ -260,7 +759,13 @@ TLSConfiguration_setupComplete(TLSConfiguration self)
 {
     if (self->setupComplete == false)
     {
+        if (self->configMutex)
+            Semaphore_wait(self->configMutex);
+
         mbedtls_ssl_conf_ca_chain(&(self->conf), &(self->cacerts), &(self->crl));
+
+        if (self->configMutex)
+            Semaphore_post(self->configMutex);
 
         if (self->ownCertificate.version > 0)
         {
@@ -275,17 +780,10 @@ TLSConfiguration_setupComplete(TLSConfiguration self)
 
         if (self->useSessionResumption)
         {
-            if (mbedtls_ssl_conf_get_endpoint(&(self->conf)) == MBEDTLS_SSL_IS_CLIENT)
+            if (mbedtls_ssl_conf_get_endpoint(&(self->conf)) == MBEDTLS_SSL_IS_SERVER)
             {
-            }
-            else
-            {
-                mbedtls_ssl_cache_init(&(self->cache));
-
-                mbedtls_ssl_cache_set_timeout(&(self->cache), self->sessionResumptionInterval);
-
-                mbedtls_ssl_conf_session_cache(&(self->conf), &(self->cache), mbedtls_ssl_cache_get,
-                                               mbedtls_ssl_cache_set);
+                tlsVersionedCacheInit(&(self->serverSessionCache));
+                self->serverSessionCache.timeout = self->sessionResumptionInterval;
             }
         }
 
@@ -313,7 +811,7 @@ TLSConfiguration_addCipherSuite(TLSConfiguration self, int ciphersuite)
         }
     }
 
-    if (nextIndex == self->maxCiphersuites)
+    if ((i == self->maxCiphersuites) || (nextIndex == self->maxCiphersuites - 1))
     {
         /* reallocate space for ciphersuites list */
         int newMaxCiphersuites = self->maxCiphersuites + 10;
@@ -354,6 +852,12 @@ TLSConfiguration_create()
 
     if (self)
     {
+        self->ownerCount = 1;
+
+#ifdef _TLS_OWN_CNT_SEM
+        self->ownerCountMutex = Semaphore_create(1);
+#endif /* TLS_OWN_CNT_SEM */
+
         /* call to psa_crypto_init required -> see https://github.com/Mbed-TLS/mbedtls/issues/9223 */
         psa_status_t psaStatus = psa_crypto_init();
 
@@ -385,8 +889,12 @@ TLSConfiguration_create()
 
         mbedtls_ssl_conf_renegotiation(&(self->conf), MBEDTLS_SSL_RENEGOTIATION_ENABLED);
 
+        /* Allow legacy renegotiation to support client-initiated renegotiation */
+        mbedtls_ssl_conf_legacy_renegotiation(&(self->conf), MBEDTLS_SSL_LEGACY_ALLOW_RENEGOTIATION);
+
         self->minVersion = TLS_VERSION_TLS_1_2;
         self->maxVersion = TLS_VERSION_NOT_SELECTED;
+        self->minKeyLengthInBits = 1024;
 
         self->renegotiationTimeInMs = -1; /* no automatic renegotiation */
 
@@ -407,6 +915,7 @@ TLSConfiguration_create()
         self->sessionResumptionInterval = 21600; /* default value: 6h */
         self->savedSession = NULL;
         self->savedSessionTime = 0;
+        self->savedSessionVersion = TLS_VERSION_NOT_SELECTED;
 
         self->ciphersuites = (int*)GLOBAL_CALLOC(20, sizeof(int));
 
@@ -433,10 +942,6 @@ TLSConfiguration_create()
             self->ciphersuites[cipherIndex++] = MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384;
             self->ciphersuites[cipherIndex++] = MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384;
 
-            /* additional ciphersuites */
-            self->ciphersuites[cipherIndex++] = MBEDTLS_TLS_RSA_WITH_NULL_SHA256;
-            self->ciphersuites[cipherIndex++] = MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384;
-
             /* TLS 1.3 cipher suites */
             self->ciphersuites[cipherIndex++] =
                 MBEDTLS_TLS1_3_AES_128_GCM_SHA256; /* mandatory according IEC 62351-3:2023 */
@@ -449,6 +954,11 @@ TLSConfiguration_create()
             self->ciphersuites[cipherIndex++] =
                 MBEDTLS_TLS1_3_AES_128_CCM_8_SHA256; /* optional according IEC 62351-3:2023 */
         }
+
+        /* initialize configuration mutex */
+        self->configMutex = Semaphore_create(1);
+
+        self->maxCertificateSizeInBytes = 8192; /* default: 8kB */
     }
 
     return self;
@@ -470,6 +980,12 @@ void
 TLSConfiguration_setSessionResumptionInterval(TLSConfiguration self, int intervalInSeconds)
 {
     self->sessionResumptionInterval = intervalInSeconds;
+
+    if (mbedtls_ssl_conf_get_endpoint(&(self->conf)) == MBEDTLS_SSL_IS_SERVER &&
+        self->serverSessionCache.initialized)
+    {
+        self->serverSessionCache.timeout = intervalInSeconds;
+    }
 }
 
 void
@@ -489,6 +1005,24 @@ void
 TLSConfiguration_setMaxTlsVersion(TLSConfiguration self, TLSConfigVersion version)
 {
     self->maxVersion = version;
+}
+
+void
+TLSConfiguration_setMinimumKeyLength(TLSConfiguration self, int keyLengthInBits)
+{
+    if (keyLengthInBits == 0)
+        keyLengthInBits = 2048;
+
+    self->minKeyLengthInBits = keyLengthInBits;
+}
+
+PAL_API void
+TLSConfiguration_setMaxCertificateSize(TLSConfiguration self, int maxSizeInBytes)
+{
+    if (maxSizeInBytes == 0)
+        maxSizeInBytes = 8192;
+
+    self->maxCertificateSizeInBytes = maxSizeInBytes;
 }
 
 void
@@ -620,9 +1154,9 @@ TLSConfiguration_addCACertificateFromFile(TLSConfiguration self, const char* fil
 }
 
 static void
-udpatedCRL(TLSConfiguration self)
+updateCRL(TLSConfiguration self)
 {
-    self->crlUpdated = Hal_getTimeInMs();
+    self->crlUpdated = Hal_getMonotonicTimeInMs();
 
     /* We need to clean-up resumption cache (if enabled) to make sure we renegotiate as CRL may have changed data */
     if (self->useSessionResumption == false)
@@ -630,14 +1164,33 @@ udpatedCRL(TLSConfiguration self)
 
     if (mbedtls_ssl_conf_get_endpoint(&(self->conf)) == MBEDTLS_SSL_IS_SERVER)
     {
-        mbedtls_ssl_cache_free(&(self->cache));
+        tlsVersionedCacheInvalidateAll(&(self->serverSessionCache));
+    }
+
+    /* If running as a client, clear any saved session so stale sessions are not resumed after CRL changes */
+    if (mbedtls_ssl_conf_get_endpoint(&(self->conf)) == MBEDTLS_SSL_IS_CLIENT)
+    {
+        if (self->savedSession)
+        {
+            mbedtls_ssl_session_free(self->savedSession);
+            GLOBAL_FREEMEM(self->savedSession);
+            self->savedSession = NULL;
+        }
+
+        self->savedSessionTime = 0;
+        self->savedSessionVersion = TLS_VERSION_NOT_SELECTED;
     }
 }
 
 bool
 TLSConfiguration_addCRL(TLSConfiguration self, uint8_t* crl, int crlLen)
 {
-    int ret = mbedtls_x509_crl_parse(&(self->crl), crl, crlLen);
+    int ret = 0;
+
+    if (self->configMutex)
+        Semaphore_wait(self->configMutex);
+
+    ret = mbedtls_x509_crl_parse(&(self->crl), crl, crlLen);
 
     if (ret != 0)
     {
@@ -645,8 +1198,12 @@ TLSConfiguration_addCRL(TLSConfiguration self, uint8_t* crl, int crlLen)
     }
     else
     {
-        udpatedCRL(self);
+        /* updatedCRL_internal expects caller to hold the lock */
+        updateCRL(self);
     }
+
+    if (self->configMutex)
+        Semaphore_post(self->configMutex);
 
     return (ret == 0);
 }
@@ -654,16 +1211,25 @@ TLSConfiguration_addCRL(TLSConfiguration self, uint8_t* crl, int crlLen)
 bool
 TLSConfiguration_addCRLFromFile(TLSConfiguration self, const char* filename)
 {
-    int ret = mbedtls_x509_crl_parse_file(&(self->crl), filename);
+    int ret = 0;
+
+    if (self->configMutex)
+        Semaphore_wait(self->configMutex);
+
+    ret = mbedtls_x509_crl_parse_file(&(self->crl), filename);
 
     if (ret != 0)
     {
         DEBUG_PRINT("TLS", "mbedtls_x509_crl_parse_file returned %d\n", ret);
+        raiseSecurityEvent(self, TLS_SEC_EVT_WARNING, TLS_EVENT_CODE_WRN_CRL_NOT_ACCESSIBLE, "Warning: CRL not accessible", NULL);
     }
     else
     {
-        udpatedCRL(self);
+        updateCRL(self);
     }
+
+    if (self->configMutex)
+        Semaphore_post(self->configMutex);
 
     return (ret == 0);
 }
@@ -671,9 +1237,15 @@ TLSConfiguration_addCRLFromFile(TLSConfiguration self, const char* filename)
 void
 TLSConfiguration_resetCRL(TLSConfiguration self)
 {
+    if (self->configMutex)
+        Semaphore_wait(self->configMutex);
+
     mbedtls_x509_crl_free(&(self->crl));
     mbedtls_x509_crl_init(&(self->crl));
-    self->crlUpdated = Hal_getTimeInMs();
+    self->crlUpdated = Hal_getMonotonicTimeInMs();
+
+    if (self->configMutex)
+        Semaphore_post(self->configMutex);
 }
 
 void
@@ -683,7 +1255,13 @@ TLSConfiguration_setRenegotiationTime(TLSConfiguration self, int timeInMs)
 }
 
 void
-TLSConfiguration_destroy(TLSConfiguration self)
+TLSConfiguration_setRenegotiationTimeout(TLSConfiguration self, int timeoutInMs)
+{
+    /* not supported */
+}
+
+static void
+destroy(TLSConfiguration self)
 {
     if (self)
     {
@@ -699,7 +1277,7 @@ TLSConfiguration_destroy(TLSConfiguration self)
             }
             else
             {
-                mbedtls_ssl_cache_free(&(self->cache));
+                tlsVersionedCacheFree(&(self->serverSessionCache));
             }
         }
 
@@ -710,6 +1288,9 @@ TLSConfiguration_destroy(TLSConfiguration self)
         mbedtls_ssl_config_free(&(self->conf));
         mbedtls_ctr_drbg_free(&(self->ctr_drbg));
         mbedtls_entropy_free(&(self->entropy));
+
+        if (self->configMutex)
+            Semaphore_destroy(self->configMutex);
 
         LinkedList certElem = LinkedList_getNext(self->allowedCertificates);
 
@@ -732,6 +1313,35 @@ TLSConfiguration_destroy(TLSConfiguration self)
             mbedtls_psa_crypto_free();
 
         GLOBAL_FREEMEM(self);
+    }
+}
+
+
+void
+TLSConfiguration_destroy(TLSConfiguration self)
+{
+    if (self)
+    {
+#ifdef _TLS_OWN_CNT_SEM
+
+        int cnt;
+
+        Semaphore_wait(self->ownerCountMutex);
+
+        cnt = self->ownerCount;
+        self->ownerCount--;
+
+        Semaphore_post(self->ownerCountMutex);
+
+        if (cnt == 1) {
+            destroy(self);
+        }
+#else
+        if (atomic_fetch_sub(&(self->ownerCount), 1) == 1)
+        {
+            destroy(self);
+        }
+#endif /* #ifdef _TLS_OWN_CNT_SEM */
     }
 }
 
@@ -802,8 +1412,8 @@ createSecurityEvents(TLSConfiguration config, int ret, uint32_t flags, TLSSocket
         break;
 
     case MBEDTLS_ERR_SSL_BAD_PROTOCOL_VERSION:
-        raiseSecurityEvent(config, TLS_SEC_EVT_INCIDENT, TLS_EVENT_CODE_ALM_HANDSHAKE_FAILED_UNKNOWN_REASON,
-                           "Alarm: Bad protocol version", socket);
+        raiseSecurityEvent(config, TLS_SEC_EVT_INCIDENT, TLS_EVENT_CODE_ALM_UNSECURE_COMMUNICATION,
+                           "Alarm: Unsecure communication", socket);
         break;
 
     case MBEDTLS_ERR_SSL_BAD_CERTIFICATE:
@@ -878,7 +1488,15 @@ createSecurityEvents(TLSConfiguration config, int ret, uint32_t flags, TLSSocket
 static int
 readFunction(void* ctx, unsigned char* buf, size_t len)
 {
-    int ret = Socket_read((Socket)ctx, buf, (int)len);
+    TLSSocket self = (TLSSocket)ctx;
+
+    if (self == NULL)
+        return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+
+    if (self->versionMismatchDetected)
+        return MBEDTLS_ERR_NET_CONN_RESET;
+
+    int ret = Socket_read(self->socket, buf, (int)len);
 
     if ((ret == 0) && (len > 0))
     {
@@ -891,7 +1509,15 @@ readFunction(void* ctx, unsigned char* buf, size_t len)
 static int
 writeFunction(void* ctx, unsigned char* buf, size_t len)
 {
-    int ret = Socket_write((Socket)ctx, buf, (int)len);
+    TLSSocket self = (TLSSocket) ctx;
+
+    if (self == NULL)
+        return MBEDTLS_ERR_NET_INVALID_CONTEXT;
+
+    //if (self->versionMismatchDetected)
+    //    return MBEDTLS_ERR_NET_CONN_RESET;
+
+    int ret = Socket_write(self->socket, buf, (int)len);
 
     if ((ret == 0) && (len > 0))
     {
@@ -957,6 +1583,11 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
         self->storePeerCert = storeClientCert;
         self->peerCert = NULL;
         self->peerCertLength = 0;
+        self->certValidationFailed = false;
+        self->lastCertVerifyFlags = 0;
+        self->handshakeInProgress = false;
+        self->versionMismatchDetected = false;
+        self->cacheAccessor = NULL;
 
         TLSConfiguration_setupComplete(configuration);
 
@@ -966,9 +1597,15 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
 
         int ret;
 
+        if (configuration->configMutex)
+            Semaphore_wait(configuration->configMutex);
+
         mbedtls_ssl_conf_ca_chain(&(self->conf), &(configuration->cacerts), &(configuration->crl));
 
         self->crlUpdated = configuration->crlUpdated;
+
+        if (configuration->configMutex)
+            Semaphore_post(configuration->configMutex);
 
         if (configuration->minVersion != TLS_VERSION_NOT_SELECTED)
         {
@@ -998,33 +1635,70 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
                 DEBUG_PRINT("TLS", "mbedtls_ssl_conf_own_cert returned %d\n", ret);
         }
 
+        if (configuration->useSessionResumption &&
+            mbedtls_ssl_conf_get_endpoint(&(configuration->conf)) == MBEDTLS_SSL_IS_SERVER)
+        {
+            if (configuration->serverSessionCache.initialized == false)
+            {
+                tlsVersionedCacheInit(&(configuration->serverSessionCache));
+                configuration->serverSessionCache.timeout = configuration->sessionResumptionInterval;
+            }
+
+            self->cacheAccessor = tlsCacheAccessorCreate(configuration, self);
+
+            if (self->cacheAccessor)
+            {
+                mbedtls_ssl_conf_session_cache( &(self->conf), self->cacheAccessor,
+                        tls_cache_get_callback,
+                        tls_cache_set_callback );
+            }
+            else
+            {
+                DEBUG_PRINT("TLS", "failed to allocate TLS cache accessor\n");
+            }
+        }
+
         ret = mbedtls_ssl_setup(&(self->ssl), &(self->conf));
 
         if (ret != 0)
-            DEBUG_PRINT("TLS", "mbedtls_ssl_setup returned %d\n", ret);
+            DEBUG_PRINT("TLS", "mbedtls_ssl_setup returned %d , -0x%x\n", ret, -ret);
 
-        mbedtls_ssl_set_bio(&(self->ssl), socket, (mbedtls_ssl_send_t*)writeFunction, (mbedtls_ssl_recv_t*)readFunction,
+        mbedtls_ssl_set_bio(&(self->ssl), self, (mbedtls_ssl_send_t*)writeFunction, (mbedtls_ssl_recv_t*)readFunction,
                             NULL);
 
         if (configuration->useSessionResumption)
         {
             if (mbedtls_ssl_conf_get_endpoint(&(configuration->conf)) == MBEDTLS_SSL_IS_CLIENT)
             {
+                if (configuration->configMutex)
+                    Semaphore_wait(configuration->configMutex);
+
                 if (configuration->savedSession && configuration->savedSessionTime > 0)
                 {
-                    if (Hal_getTimeInMs() <
+                    if (Hal_getMonotonicTimeInMs() <
                         (configuration->savedSessionTime + configuration->sessionResumptionInterval * 1000))
                     {
-                        ret = mbedtls_ssl_set_session(&(self->ssl), configuration->savedSession);
-
-                        if (ret != 0)
+                        if (configuration->savedSessionTime > 0) /* Only proceed if session wasn't invalidated */
                         {
-                            DEBUG_PRINT("TLS", "mbedtls_ssl_set_session returned %d\n", ret);
-                            configuration->savedSessionTime = 0;
+                            ret = mbedtls_ssl_set_session(&(self->ssl), configuration->savedSession);
+
+                            if (ret != 0)
+                            {
+                                DEBUG_PRINT("TLS", "mbedtls_ssl_set_session returned %d\n", ret);
+                                configuration->savedSessionTime = 0;
+                            }
+                            else
+                            {
+                                DEBUG_PRINT("TLS", "resume TLS session\n");
+                            }
                         }
                         else
                         {
-                            DEBUG_PRINT("TLS", "resume TLS session\n");
+                            if (configuration->configMutex)
+                                Semaphore_post(configuration->configMutex);
+
+                            GLOBAL_FREEMEM(self);
+                            return NULL;
                         }
                     }
                     else
@@ -1033,8 +1707,14 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
                         DEBUG_PRINT("TLS", "cached session expired\n");
                     }
                 }
+
+                if (configuration->configMutex)
+                    Semaphore_post(configuration->configMutex);
             }
         }
+
+        /* disable host name verification */
+        mbedtls_ssl_set_hostname(&(self->ssl), NULL);
 
         while ((ret = mbedtls_ssl_handshake(&(self->ssl))) != 0)
         {
@@ -1044,7 +1724,10 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
 
                 uint32_t flags = mbedtls_ssl_get_verify_result(&(self->ssl));
 
-                createSecurityEvents(configuration, ret, flags, self);
+                if (self->versionMismatchDetected == false)
+                {
+                    createSecurityEvents(configuration, ret, flags, self);
+                }
 
                 mbedtls_ssl_free(&(self->ssl));
 
@@ -1053,16 +1736,32 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
                     GLOBAL_FREEMEM(self->peerCert);
                 }
 
+                tlsCacheAccessorDestroy(self->cacheAccessor);
                 GLOBAL_FREEMEM(self);
 
                 return NULL;
             }
         }
 
+        if (self->versionMismatchDetected)
+        {
+            DEBUG_PRINT("TLS", "Handshake flagged TLS version mismatch after completion\n");
+            mbedtls_ssl_free(&(self->ssl));
+            if (self->peerCert)
+                GLOBAL_FREEMEM(self->peerCert);
+
+            tlsCacheAccessorDestroy(self->cacheAccessor);
+            GLOBAL_FREEMEM(self);
+            return NULL;
+        }
+
         if (configuration->useSessionResumption)
         {
             if (mbedtls_ssl_conf_get_endpoint(&(configuration->conf)) == MBEDTLS_SSL_IS_CLIENT)
             {
+                if (configuration->configMutex)
+                    Semaphore_wait(configuration->configMutex);
+
                 if (configuration->savedSession == NULL)
                 {
                     configuration->savedSession = (mbedtls_ssl_session*)GLOBAL_CALLOC(1, sizeof(mbedtls_ssl_session));
@@ -1080,14 +1779,20 @@ TLSSocket_create(Socket socket, TLSConfiguration configuration, bool storeClient
                         }
                         else
                         {
-                            configuration->savedSessionTime = Hal_getTimeInMs();
+                            configuration->savedSessionTime = Hal_getMonotonicTimeInMs();
+                            /* Save the TLS version of this session */
+                            configuration->savedSessionVersion = getTLSVersion(&(self->ssl));
                         }
                     }
                 }
+
+                if (configuration->configMutex)
+                    Semaphore_post(configuration->configMutex);
             }
         }
 
-        self->lastRenegotiationTime = Hal_getTimeInMs();
+        self->lastRenegotiationTime = Hal_getMonotonicTimeInMs();
+        self->lastActivityTime = self->lastRenegotiationTime;
 
         /* create event that TLS session is established */
         {
@@ -1144,17 +1849,27 @@ TLSSocket_performHandshake(TLSSocket self)
 static void
 checkForCRLUpdate(TLSSocket self)
 {
-    if (self->crlUpdated == self->tlsConfig->crlUpdated)
-        return;
+    bool changed = false;
 
-    DEBUG_PRINT("TLS", "CRL updated -> refresh CA chain\n");
+    if (self->tlsConfig->configMutex)
+        Semaphore_wait(self->tlsConfig->configMutex);
 
-    mbedtls_ssl_conf_ca_chain(&(self->conf), &(self->tlsConfig->cacerts), &(self->tlsConfig->crl));
+    changed = (self->crlUpdated != self->tlsConfig->crlUpdated);
 
-    self->crlUpdated = self->tlsConfig->crlUpdated;
+    if (changed)
+    {
+        DEBUG_PRINT("TLS", "CRL updated -> refresh CA chain\n");
 
-    /* IEC TS 62351-100-3 Conformance test 6.2.6 requires that upon CRL update a TLS renegotiation should occur */
-    self->lastRenegotiationTime = 0;
+        mbedtls_ssl_conf_ca_chain(&(self->conf), &(self->tlsConfig->cacerts), &(self->tlsConfig->crl));
+
+        self->crlUpdated = self->tlsConfig->crlUpdated;
+
+        /* IEC TS 62351-100-3 Conformance test 6.2.6 requires that upon CRL update a TLS renegotiation should occur */
+        self->lastRenegotiationTime = 0;
+    }
+
+    if (self->tlsConfig->configMutex)
+        Semaphore_post(self->tlsConfig->configMutex);
 }
 
 /* true = renegotiation is not needed or it is successfull, false = Failed */
@@ -1174,7 +1889,7 @@ startRenegotiationIfRequired(TLSSocket self)
         return true;
     }
 
-    if (Hal_getTimeInMs() <= self->lastRenegotiationTime + self->tlsConfig->renegotiationTimeInMs)
+    if (Hal_getMonotonicTimeInMs() <= self->lastRenegotiationTime + self->tlsConfig->renegotiationTimeInMs)
         return true;
 
     raiseSecurityEvent(self->tlsConfig, TLS_SEC_EVT_INFO, TLS_EVENT_CODE_INF_SESSION_RENEGOTIATION,
@@ -1187,7 +1902,29 @@ startRenegotiationIfRequired(TLSSocket self)
     }
 
     DEBUG_PRINT("TLS", "started renegotiation\n");
-    self->lastRenegotiationTime = Hal_getTimeInMs();
+    self->lastRenegotiationTime = Hal_getMonotonicTimeInMs();
+
+    return true;
+}
+
+bool
+TLSSocket_tick(TLSSocket self)
+{
+    checkForCRLUpdate(self);
+
+    /* Only initiate a new renegotiation when the connection is truly idle:
+     * no TLSSocket_read/write has occurred for at least a full renegotiation
+     * interval.  Polled connections drive renegotiation through those paths;
+     * the full-interval idle check prevents duplicate initiations. */
+    if (self->tlsConfig->renegotiationTimeInMs > 0)
+    {
+        uint64_t now = Hal_getMonotonicTimeInMs();
+        if (now - self->lastActivityTime >= (uint64_t)self->tlsConfig->renegotiationTimeInMs)
+        {
+            if (startRenegotiationIfRequired(self) == false)
+                return false;
+        }
+    }
 
     return true;
 }
@@ -1195,22 +1932,38 @@ startRenegotiationIfRequired(TLSSocket self)
 int
 TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
 {
+    if (self->handshakeInProgress) {
+        /* Avoid reading data while handshake is in progress */
+        return 0;
+    }
+
+    self->lastActivityTime = Hal_getMonotonicTimeInMs();
+
     checkForCRLUpdate(self);
 
-    if (startRenegotiationIfRequired(self) == false)
-    {
+    if (startRenegotiationIfRequired(self) == false) {
         return -1;
     }
 
-    int ret = mbedtls_ssl_read(&(self->ssl), buf, size);
-
-    if ((ret == MBEDTLS_ERR_SSL_WANT_READ) || (ret == MBEDTLS_ERR_SSL_WANT_WRITE))
-        return 0;
-
-    if (ret < 0)
+    int len = 0;
+    while (len < size)
     {
-        switch (ret)
-        {
+        int ret = mbedtls_ssl_read(&(self->ssl), (buf + len), (size - len));
+
+        if (ret > 0) {
+            len += ret;
+            continue;
+        }
+
+        switch (ret) {
+        case 0: /* falling through */
+        case MBEDTLS_ERR_SSL_WANT_READ:
+        case MBEDTLS_ERR_SSL_WANT_WRITE:
+        case MBEDTLS_ERR_SSL_ASYNC_IN_PROGRESS:
+        case MBEDTLS_ERR_SSL_CRYPTO_IN_PROGRESS:
+            /* Known "good" cases indicating the read is done */
+            return len;
+
         case MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY:
             DEBUG_PRINT("TLS", " connection was closed gracefully\n");
             return -1;
@@ -1221,24 +1974,63 @@ TLSSocket_read(TLSSocket self, uint8_t* buf, int size)
 
         default:
             DEBUG_PRINT("TLS", " mbedtls_ssl_read returned -0x%x\n", -ret);
-
             {
                 uint32_t flags = mbedtls_ssl_get_verify_result(&(self->ssl));
 
-                createSecurityEvents(self->tlsConfig, ret, flags, self);
-            }
+                /* If verify result unavailable (renegotiation context), use cached flags */
+                if (flags == 0 && self->lastCertVerifyFlags != 0)
+                {
+                    flags = self->lastCertVerifyFlags;
+                    DEBUG_PRINT("TLS", " using cached cert verify flags: 0x%x\n", flags);
+                }
 
-            return -1;
+                /* Only generate security events once per certificate validation failure.
+                 * After initial failure, certValidationFailed is set and subsequent read
+                 * attempts should not generate duplicate events. */
+                if (flags != 0 && !self->certValidationFailed)
+                {
+                    self->certValidationFailed = true;
+                    createSecurityEvents(self->tlsConfig, ret, flags, self);
+                }
+                else if (flags == 0)
+                {
+                    /* No certificate error, generate events for other error types */
+                    createSecurityEvents(self->tlsConfig, ret, flags, self);
+                }
+
+                /* connection should be closed on error */
+                return -1;
+            }
         }
+
+        /* Do NOT reset session if certificate validation failed - connection should terminate cleanly
+         * to prevent repeated handshake attempts. Resetting would allow the peer to retry the handshake
+         * which will fail again with the same certificate error, causing a loop. */
+        if (!self->certValidationFailed)
+        {
+            int reset_err = mbedtls_ssl_session_reset(&(self->ssl));
+            if (0 != reset_err) {
+                DEBUG_PRINT("TLS", "mbedtls_ssl_session_reset failed -0x%X\n", -reset_err);
+            }
+        }
+
+        return ret;
     }
 
-    return ret;
+    return len;
 }
 
 int
 TLSSocket_write(TLSSocket self, uint8_t* buf, int size)
 {
     int len = 0;
+
+    if (self->handshakeInProgress) {
+        /* Avoid writing data while handshake is in progress */
+        return 0;
+    }
+
+    self->lastActivityTime = Hal_getMonotonicTimeInMs();
 
     checkForCRLUpdate(self);
 
@@ -1279,8 +2071,6 @@ TLSSocket_close(TLSSocket self)
 {
     int ret;
 
-    /* TODO add timeout? */
-
     while ((ret = mbedtls_ssl_close_notify(&(self->ssl))) < 0)
     {
         if ((ret != MBEDTLS_ERR_SSL_WANT_READ) && (ret != MBEDTLS_ERR_SSL_WANT_WRITE))
@@ -1297,6 +2087,7 @@ TLSSocket_close(TLSSocket self)
     if (self->peerCert)
         GLOBAL_FREEMEM(self->peerCert);
 
+    tlsCacheAccessorDestroy(self->cacheAccessor);
     GLOBAL_FREEMEM(self);
 }
 
@@ -1363,4 +2154,18 @@ TLSConfigVersion_toString(TLSConfigVersion version)
     default:
         return "unknown TLS version";
     }
+}
+
+TLSConfiguration
+TLSConfiguration_claimOwnership(TLSConfiguration self)
+{
+#ifdef _TLS_OWN_CNT_SEM
+    Semaphore_wait(self->ownerCountMutex);
+    self->ownerCount++;
+    Semaphore_post(self->ownerCountMutex);
+#else
+    atomic_fetch_add(&(self->ownerCount), 1);
+#endif
+
+    return self;
 }

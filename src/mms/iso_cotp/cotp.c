@@ -5,7 +5,7 @@
  *
  *  Partial implementation of the ISO 8073 COTP (ISO TP0) protocol for MMS.
  *
- *  Copyright 2013-2024 Michael Zillgith
+ *  Copyright 2013-2026 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -341,6 +341,10 @@ CotpConnection_sendDataMessage(CotpConnection* self, BufferChain payload)
             if (currentChainIndex >= currentChain->partLength)
             {
                 currentChain = currentChain->nextPart;
+
+                if (currentChain == NULL)
+                    goto exit_function;
+
                 if (DEBUG_COTP)
                     printf("COTP: nextBufferPart: len:%i partLen:%i\n", currentChain->length, currentChain->partLength);
                 currentChainIndex = 0;
@@ -442,6 +446,9 @@ CotpConnection_sendConnectionResponseMessage(CotpConnection* self)
     int optionsLength = getOptionsLength(self);
     int messageLength = 11 + optionsLength;
 
+    if(self->writeBuffer->maxSize < messageLength)
+        return COTP_ERROR;
+
     writeRfc1006Header(self, messageLength);
 
     writeStaticConnectResponseHeader(self, optionsLength);
@@ -461,6 +468,11 @@ parseOptions(CotpConnection* self, uint8_t* buffer, int bufLen)
 
     while (bufPos < bufLen)
     {
+        if (bufPos + 2 > bufLen)
+        {
+            goto cpo_error;
+        }
+
         uint8_t optionType = buffer[bufPos++];
         uint8_t optionLen = buffer[bufPos++];
 
@@ -476,17 +488,27 @@ parseOptions(CotpConnection* self, uint8_t* buffer, int bufLen)
 
         switch (optionType) {
         case 0xc0:
-			if (optionLen == 1)
+            if (optionLen == 1)
             {
-				int requestedTpduSize = (1 << buffer[bufPos++]);
+                uint8_t rawRequestedTpduSize = buffer[bufPos++];
+
+                if (rawRequestedTpduSize < 7 || rawRequestedTpduSize > 13)
+                {
+                    if (DEBUG_COTP)
+                        printf("COTP: invalid TPDU size requested: %i\n", (int)rawRequestedTpduSize);
+
+                    goto cpo_error;
+                }
+
+                int requestedTpduSize = (1 << rawRequestedTpduSize);
 
                 CotpConnection_setTpduSize(self, requestedTpduSize);
 
-				if (DEBUG_COTP)
-				    printf("COTP: requested TPDU size: %i\n", requestedTpduSize);
-			}
-			else
-			    goto cpo_error;
+                if (DEBUG_COTP)
+                    printf("COTP: requested TPDU size: %i\n", requestedTpduSize);
+            }
+            else
+                goto cpo_error;
             break;
 
         case 0xc1: /* remote T-selector */
@@ -745,7 +767,6 @@ parseCotpMessage(CotpConnection* self)
     default:
         return COTP_ERROR;
     }
-
 }
 
 CotpIndication

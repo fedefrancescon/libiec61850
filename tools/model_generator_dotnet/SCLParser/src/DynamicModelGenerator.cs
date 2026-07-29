@@ -8,8 +8,10 @@
 
 using IEC61850.SCL.DataModel;
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.Serialization;
+using System.Linq;
 
 namespace IEC61850.SCL
 {
@@ -27,6 +29,15 @@ namespace IEC61850.SCL
             this.iED = iED;
 
             connectedAP = sclDocument.GetConnectedAP(accessPoint.Name, iED.Name);
+
+            SclServices services = accessPoint.SclServices;
+            if (services == null)
+            {
+                SclIED sclIed = sclDocument.IEDs.Find(x => x.Name == iED.Name);
+                services = sclIed?.SclServices;
+            }
+            if (services?.ReportSettings != null)
+                hasOwner = services.ReportSettings.Owner;
 
             output.WriteLine("MODEL(" + iED.Name + "){");
             foreach (LogicalDevice ld in iED.LogicalDevices)
@@ -98,16 +109,16 @@ namespace IEC61850.SCL
 
             foreach (GSEControl gcb in logicalNode.GSEControls)
             {
-                PrintGSEControl(output, gcb);
+                PrintGSEControl(output, gcb, logicalDevice);
             }
 
             foreach (SMVControl smv in logicalNode.SMVControls)
             {
-                PrintSMVControl(output, smv);
+                PrintSMVControl(output, smv, logicalDevice);
             }
         }
 
-        private void PrintGSEControl(StreamWriter output, GSEControl gcb)
+        private void PrintGSEControl(StreamWriter output, GSEControl gcb, LogicalDevice ld)
         {
             SclGSE gse = null;
             SclAddress gseAddress = null;
@@ -115,7 +126,24 @@ namespace IEC61850.SCL
             if (connectedAP != null)
             {
                 gse = connectedAP.GSEs.Find(x => x.CbName == gcb.Name);
-
+                if (gse == null)
+                {
+                    bool found = false;
+                    foreach (SclConnectedAP ap in sclDocument.GetConnectedAPs())
+                    {
+                        foreach (SclGSE sclGSE in ap.GSEs)
+                        {
+                            if (sclGSE.CbName == gcb.Name && sclGSE.LdInst == ld.Inst)
+                            {
+                                gse = sclGSE;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found)
+                            break;
+                    }
+                }
                 if (gse != null)
                     gseAddress = gse.SclAddress;
             }
@@ -153,18 +181,18 @@ namespace IEC61850.SCL
                 if (gse.Mintime != null)
                     output.Write(gse.Mintime);
                 else
-                    output.Write("0");
+                    output.Write("-1");
 
                 output.Write(' ');
 
                 if (gse.Maxtime != null)
                     output.Write(gse.Maxtime);
                 else
-                    output.Write("0");
+                    output.Write("-1");
             }
             else
             {
-                output.Write("0 0");
+                output.Write("-1 -1");
             }
 
             if (gseAddress == null)
@@ -173,16 +201,19 @@ namespace IEC61850.SCL
             }
             else
             {
+                int appID_decimal = Convert.ToInt32(gseAddress.AppId, 16);
+                int vlanID_decimal = Convert.ToInt32(gseAddress.VlanId, 16);
+
                 output.WriteLine("){");
 
                 output.Write("PA(");
                 output.Write(gseAddress.VlanPriority + " ");
-                output.Write(gseAddress.VlanId + " ");
-                output.Write(gseAddress.AppId + " ");
+                output.Write(vlanID_decimal.ToString() + " ");
+                output.Write(appID_decimal.ToString() + " ");
 
                 for (int i = 0; i < 6; i++)
                 {
-                    string hexValue = gseAddress.MacAddress[i].ToString("X2");
+                    string hexValue = gseAddress.MacAddress[i].ToString("x2");
                     output.Write(hexValue);
                 }
 
@@ -192,7 +223,7 @@ namespace IEC61850.SCL
             }
         }
 
-        private void PrintSMVControl(StreamWriter output, SMVControl smv)
+        private void PrintSMVControl(StreamWriter output, SMVControl smv, LogicalDevice ld)
         {
             SclSMV sclsmv = null;
             SclAddress smvAddress = null;
@@ -200,6 +231,25 @@ namespace IEC61850.SCL
             if (connectedAP != null)
             {
                 sclsmv = connectedAP.SMVs.Find(x => x.CbName == smv.Name);
+                if(sclsmv == null)
+                {
+                    bool found = false;
+                    foreach (SclConnectedAP ap in sclDocument.GetConnectedAPs())
+                    {
+                        foreach(SclSMV sclSMV in ap.SMVs)
+                        {
+                            if(sclSMV.CbName == smv.Name && sclSMV.LdInst == ld.Inst)
+                            {
+                                sclsmv = sclSMV;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found)
+                            break;  
+
+                    }
+                }
 
                 if (sclsmv != null)
                     smvAddress = sclsmv.SclAddress;
@@ -223,7 +273,16 @@ namespace IEC61850.SCL
                 output.Write("0 ");
 
             if (smv.SclSMVControl.SmpMod != null)
-                output.Write(smv.SclSMVControl.SmpMod + " ");
+            {
+                int smp_val = -1;
+                if (smv.SclSMVControl.SmpMod == "SmpPerPeriod")
+                    smp_val = 0;
+                else if (smv.SclSMVControl.SmpMod == "SmpPerSec")
+                    smp_val = 1;
+                else if (smv.SclSMVControl.SmpMod == "SmpPerSamp")
+                    smp_val = 2;
+                output.Write(smp_val + " ");
+            }
             else
                 output.Write("0 ");
 
@@ -252,16 +311,18 @@ namespace IEC61850.SCL
             }
             else
             {
+                int appID_decimal = Convert.ToInt32(smvAddress.AppId, 16);
+                int vlanID_decimal = Convert.ToInt32(smvAddress.VlanId, 16);
                 output.WriteLine("){");
 
                 output.Write("PA(");
                 output.Write(smvAddress.VlanPriority + " ");
-                output.Write(smvAddress.VlanId + " ");
-                output.Write(smvAddress.AppId + " ");
+                output.Write(vlanID_decimal + " ");
+                output.Write(appID_decimal + " ");
 
                 for (int i = 0; i < 6; i++)
                 {
-                    string hexValue = smvAddress.MacAddress[i].ToString("X2");
+                    string hexValue = smvAddress.MacAddress[i].ToString("x2");
                     output.Write(hexValue);
                 }
 
@@ -515,7 +576,7 @@ namespace IEC61850.SCL
         }
 
 
-        void printDataAttributes(StreamWriter output, DataAttribute dataAttribute, bool isTransient)
+        void printDataAttributes(StreamWriter output, DataAttribute dataAttribute, bool isTransient, int trgOpsVal, int arrayIndex=-1)
         {
             if (dataAttribute.AttributeType != AttributeType.CONSTRUCTED)
             {
@@ -526,28 +587,42 @@ namespace IEC61850.SCL
 
                 string value = null;
 
+                SclDataAttributeDefinition definition = dataAttribute.Definition;
+                List<SclVal> predefined_vals = definition.GetValues();
+                if (predefined_vals != null)
+                {
+                    if(arrayIndex >= 0)
+                    {
+                        if (predefined_vals.Count > arrayIndex)
+                        {
+                            value = predefined_vals[arrayIndex].Value;
+                        }
+                    }
+                    else
+                    {
+                        value = predefined_vals[0].Value;
+                    }
+
+                }
+
                 SclDOI sclDOI = logicalNode.SclElement.DOIs.Find(x => x.Name == dataObject.Name);
 
-                if(sclDOI == null)
+                if (sclDOI != null)
                 {
-                    output.WriteLine(";");
-                    return;
+                    SclDAI sclDAI = sclDOI.SclDAIs.Find(x => x.Name == dataAttribute.Name);
+                    if (sclDAI != null && dataAttribute.ObjRef == logicalDevice.Name + "/" + logicalNode.Name + "." + sclDOI.Name + "." + sclDAI.Name)
+                    {
+                        value = sclDAI.Val;
+                    }
 
+                    else
+                    {
+                        string strippedObjRef = getStippedObjRef(dataAttribute.ObjRef);
+                        sclDAI = getNestedDAI(sclDOI, strippedObjRef);
+                        value = sclDAI?.Val;
+                    }
                 }
-                SclDAI sclDAI = sclDOI.SclDAIs.Find(x => x.Name == dataAttribute.Name);
-                if (sclDAI != null && dataAttribute.ObjRef == logicalDevice.Name + "/" + logicalNode.Name + "." + sclDOI.Name + "." + sclDAI.Name)
-                {
-                    value = sclDAI.Val;   
-                }
-
-                else
-                {
-                    string strippedObjRef = getStippedObjRef(dataAttribute.ObjRef);
-                    sclDAI = getNestedDAI(sclDOI, strippedObjRef);
-                    value = sclDAI?.Val;
-                }
-
-
+                
                 if (value != null)
                 {
                     switch (dataAttribute.AttributeType)
@@ -581,7 +656,7 @@ namespace IEC61850.SCL
                             break;
 
                         case AttributeType.BOOLEAN:
-                            if (value == "true")
+                            if (value == "true" || value == "1")
                                 output.Write("=1");
                             else
                                 output.Write("=0");
@@ -627,7 +702,7 @@ namespace IEC61850.SCL
 
                 foreach (DataAttribute subDataAttribute in dataAttribute.SubDataAttributes)
                 {
-                    ExportDataAttribute(output, subDataAttribute, isTransient);
+                    ExportDataAttribute(output, subDataAttribute, isTransient, trgOpsVal);
                 }
 
                 output.WriteLine("}");
@@ -635,23 +710,26 @@ namespace IEC61850.SCL
 
         }
 
-        private void ExportDataAttribute(StreamWriter output, DataAttribute dataAttribute, bool isTransient)
+        private void ExportDataAttribute(StreamWriter output, DataAttribute dataAttribute, bool isTransient, int? parentTrgOps = null)
         {
             output.Write("DA(" + dataAttribute.Name + " ");
             output.Write(dataAttribute.Count + " ");
             output.Write((int)dataAttribute.AttributeType + " ");
             output.Write((int)dataAttribute.Fc + " ");
 
-            if (dataAttribute.Definition.TriggerOptions != null)
-            {
-                int trgOpsVal = dataAttribute.Definition.TriggerOptions.GetIntValue();
+            // Sub-DAs inherit trigger options from parent DA (matching Java behaviour)
+            int trgOpsVal;
+            if (parentTrgOps.HasValue)
+                trgOpsVal = parentTrgOps.Value;
+            else if (dataAttribute.Definition.TriggerOptions != null)
+                trgOpsVal = dataAttribute.Definition.TriggerOptions.GetIntValue();
+            else
+                trgOpsVal = 0;
 
-                if (isTransient)
-                    trgOpsVal += 128;
+            if (isTransient)
+                trgOpsVal += 128;
 
-                output.Write(trgOpsVal + " ");
-            }
-
+            output.Write(trgOpsVal + " ");
 
             if (dataAttribute.Definition.SAddr != null)
                 output.Write(dataAttribute.Definition.SAddr);
@@ -668,7 +746,7 @@ namespace IEC61850.SCL
                 {
                     output.Write("[" + i + "]");
 
-                    printDataAttributes(output, dataAttribute, isTransient);
+                    printDataAttributes(output, dataAttribute, isTransient, trgOpsVal, i);
                 }
 
                 output.WriteLine("}");
@@ -677,7 +755,7 @@ namespace IEC61850.SCL
             else
             {
 
-                printDataAttributes(output, dataAttribute, isTransient);
+                printDataAttributes(output, dataAttribute, isTransient, trgOpsVal);
             }
         }
 
@@ -770,7 +848,6 @@ namespace IEC61850.SCL
             }
 
             output.WriteLine("}");
-
         }
     }
 }

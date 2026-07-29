@@ -1,7 +1,7 @@
 /*
  *  mms_get_namelist_service.c
  *
- *  Copyright 2013-2023 Michael Zillgith
+ *  Copyright 2013-2026 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -544,15 +544,41 @@ mmsServer_handleGetNameListRequest(
         {
 
         case 0xa0: /* objectClass */
-            bufPos++;
-            length = buffer[bufPos++];
-            objectClass = BerDecoder_decodeUint32(buffer, length, bufPos);
-            break;
+            {
+                int outerEndBufPos = bufPos + length;
+
+                if (length < 3 || outerEndBufPos > maxBufPos)
+                {
+                    mmsMsg_createMmsRejectPdu(&invokeId, MMS_ERROR_REJECT_INVALID_PDU, response);
+                    return;
+                }
+
+                bufPos++;  /* skip inner tag */
+                bufPos = BerDecoder_decodeLength(buffer, &length, bufPos, outerEndBufPos);
+
+                if (bufPos < 0)
+                {
+                    mmsMsg_createMmsRejectPdu(&invokeId, MMS_ERROR_REJECT_INVALID_PDU, response);
+                    return;
+                }
+
+                objectClass = BerDecoder_decodeUint32(buffer, length, bufPos);
+
+                break;
+            }
 
         case 0xa1: /* objectScope */
             {
+                int outerEndBufPos = bufPos + length;
+
+                if (length < 2 || outerEndBufPos > maxBufPos)
+                {
+                    mmsMsg_createMmsRejectPdu(&invokeId, MMS_ERROR_REJECT_INVALID_PDU, response);
+                    return;
+                }
+
                 uint8_t objectScopeTag = buffer[bufPos++];
-                bufPos = BerDecoder_decodeLength(buffer, &length, bufPos, maxBufPos);
+                bufPos = BerDecoder_decodeLength(buffer, &length, bufPos, outerEndBufPos);
 
                 if (bufPos < 0)
                 {
@@ -829,7 +855,8 @@ mmsServer_handleGetNameListRequest(
 #endif /* (MMS_DYNAMIC_DATA_SETS == 1) */
 #endif /* (MMS_DATA_SET_SERVICE == 1) */
 
-    else {
+    else
+    {
         if (DEBUG_MMS_SERVER)
             printf("MMS_SERVER:  getNameList(%i) not supported!\n", objectScope);
 

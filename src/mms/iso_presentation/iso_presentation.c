@@ -1,7 +1,7 @@
 /*
  *  iso_presentation.c
  *
- *  Copyright 2013-2025 Michael Zillgith
+ *  Copyright 2013-2026 Michael Zillgith
  *
  *  This file is part of libIEC61850.
  *
@@ -196,7 +196,7 @@ parseFullyEncodedData(IsoPresentation* self, uint8_t* buffer, int len, int bufPo
 
     int endPos = bufPos + len;
 
-    if (buffer[bufPos++] != 0x30)
+    if (len < 1 || buffer[bufPos++] != 0x30)
     {
         if (DEBUG_PRES)
             printf("PRES: user-data parse error\n");
@@ -426,13 +426,6 @@ parseNormalModeParameters(IsoPresentation* self, uint8_t* buffer, int totalLengt
         uint8_t tag = buffer[bufPos++];
         int len;
 
-        if (bufPos == endPos)
-        {
-            if (DEBUG_PRES)
-                printf("PRES: invalid message\n");
-            return -1;
-        }
-
         bufPos = BerDecoder_decodeLength(buffer, &len, bufPos, endPos);
 
         if (bufPos < 0)
@@ -549,6 +542,13 @@ IsoPresentation_parseAcceptMessage(IsoPresentation* self, ByteBuffer* byteBuffer
     int maxBufPos = byteBuffer->size;
 
     int bufPos = 0;
+
+    if (maxBufPos < 1)
+    {
+        if (DEBUG_PRES)
+            printf("PRES: invalid message!\n");
+        return 0;
+    }
 
     uint8_t cpTag = buffer[bufPos++];
 
@@ -715,7 +715,7 @@ IsoPresentation_parseUserData(IsoPresentation* self, ByteBuffer* readBuffer)
         return 0;
     }
 
-    while (bufPos < maxBufPos)
+    while (bufPos + 1 < maxBufPos)
     {
         uint8_t tag = buffer[bufPos++];
         uint8_t lenField = buffer[bufPos];
@@ -740,7 +740,7 @@ IsoPresentation_parseUserData(IsoPresentation* self, ByteBuffer* readBuffer)
         case 0x06: /* transfer-syntax-name */
             {
                 /* check if basic-encoding (2.1.1 - 51 01) */
-                if ((buffer[bufPos] != 0x51) || (buffer[bufPos + 1] != 0x01))
+                if (len < 2 || (buffer[bufPos] != 0x51) || (buffer[bufPos + 1] != 0x01))
                 {
                     if (DEBUG_PRES)
                     {
@@ -789,6 +789,13 @@ IsoPresentation_parseConnect(IsoPresentation* self, ByteBuffer* byteBuffer)
 
     int bufPos = 0;
 
+    if (maxBufPos < 1)
+    {
+        if (DEBUG_PRES)
+            printf("PRES: invalid message!\n");
+        return 0;
+    }
+
     uint8_t cpTag = buffer[bufPos++];
 
     if (cpTag != 0x31)
@@ -829,7 +836,7 @@ IsoPresentation_parseConnect(IsoPresentation* self, ByteBuffer* byteBuffer)
         {
         case 0xa0: /* mode-selection */
             {
-                if (buffer[bufPos++] != 0x80)
+                if (len < 1 || buffer[bufPos++] != 0x80)
                 {
                     if (DEBUG_PRES)
                         printf("PRES: mode-value of wrong type!\n");
